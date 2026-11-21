@@ -15,16 +15,10 @@ WORKDIR /app
 COPY src/ /app/src/
 COPY run.sh /app/run.sh
 
-# Compile C++ engine with PyArrow Arrow/Parquet C++ libraries and native x86-64-v3 optimization
-RUN PYARROW_INC=$(python3 -c "import pyarrow; print(pyarrow.get_include())") && \
-    PYARROW_LIB=$(python3 -c "import pyarrow; print(pyarrow.get_library_dirs()[0])") && \
-    g++ -O3 -std=c++20 -march=x86-64-v3 -DNDEBUG -pthread \
-    -isystem "${PYARROW_INC}" \
+# Compile C++ engine with native optimization (pure standard C++20, no external C++ libraries needed)
+RUN g++ -O3 -std=c++20 -march=x86-64-v3 -DNDEBUG -pthread \
     /app/src/engine.cpp \
     -o /app/engine \
-    -L"${PYARROW_LIB}" \
-    -lparquet -larrow \
-    -Wl,-rpath,"${PYARROW_LIB}" \
     && apt-get purge -y build-essential \
     && apt-get autoremove -y \
     && rm -rf /var/lib/apt/lists/* \

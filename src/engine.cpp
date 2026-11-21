@@ -1,6 +1,3 @@
-#include <arrow/api.h>
-#include <arrow/io/file.h>
-#include <parquet/arrow/writer.h>
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -1694,78 +1691,33 @@ int main(int argc, char *argv[]) {
       for (auto& w : workers) w.join();
     }
 
-    fs::create_directories(output_dir + "/user_daily");
-    fs::create_directories(output_dir + "/campaign_daily");
+    uint64_t header[4] = {static_cast<uint64_t>(total_ud),
+                          static_cast<uint64_t>(b_u_chars.size()),
+                          static_cast<uint64_t>(b_c_chars.size()), 0};
 
-    auto user_daily_schema = arrow::schema({
-        arrow::field("user_id", arrow::utf8(), false),
-        arrow::field("day", arrow::date32(), false),
-        arrow::field("sessions", arrow::int64(), false),
-        arrow::field("events", arrow::int64(), false),
-        arrow::field("revenue_cents", arrow::int64(), false),
-        arrow::field("top_category", arrow::utf8(), true)
-    });
+    std::ofstream out(scratch_dir + "/_ud.bin", std::ios::binary);
+    out.write(reinterpret_cast<const char *>(header), sizeof(header));
+    out.write(reinterpret_cast<const char *>(b_days.data()),
+              b_days.size() * sizeof(int32_t));
+    out.write(reinterpret_cast<const char *>(b_sess.data()),
+              b_sess.size() * sizeof(int64_t));
+    out.write(reinterpret_cast<const char *>(b_evts.data()),
+              b_evts.size() * sizeof(int64_t));
+    out.write(reinterpret_cast<const char *>(b_rev.data()),
+              b_rev.size() * sizeof(int64_t));
+    out.write(reinterpret_cast<const char *>(b_u_off.data()),
+              b_u_off.size() * sizeof(int32_t));
+    out.write(b_u_chars.data(), b_u_chars.size());
+    out.write(reinterpret_cast<const char *>(b_c_bmp.data()), b_c_bmp.size());
+    out.write(reinterpret_cast<const char *>(b_c_off.data()),
+              b_c_off.size() * sizeof(int32_t));
+    out.write(b_c_chars.data(), b_c_chars.size());
+    out.flush();
+    out.close();
+  }
 
-    std::shared_ptr<arrow::Table> ud_table;
-    if (total_ud == 0) {
-      arrow::StringBuilder uid_b;
-      arrow::Date32Builder day_b;
-      arrow::Int64Builder sess_b, evts_b, rev_b;
-      arrow::StringBuilder cat_b;
-      std::shared_ptr<arrow::Array> uid_a, day_a, sess_a, evts_a, rev_a, cat_a;
-      (void)uid_b.Finish(&uid_a);
-      (void)day_b.Finish(&day_a);
-      (void)sess_b.Finish(&sess_a);
-      (void)evts_b.Finish(&evts_a);
-      (void)rev_b.Finish(&rev_a);
-      (void)cat_b.Finish(&cat_a);
-      ud_table = arrow::Table::Make(user_daily_schema, {uid_a, day_a, sess_a, evts_a, rev_a, cat_a});
-    } else {
-      auto u_off_buf = arrow::Buffer::Wrap(b_u_off.data(), b_u_off.size() * sizeof(int32_t));
-      auto u_char_buf = arrow::Buffer::Wrap(reinterpret_cast<const uint8_t*>(b_u_chars.data()), b_u_chars.size());
-      auto u_data = arrow::ArrayData::Make(arrow::utf8(), total_ud, {nullptr, u_off_buf, u_char_buf}, 0);
-      auto u_arr = arrow::MakeArray(u_data);
-
-      auto day_buf = arrow::Buffer::Wrap(b_days.data(), b_days.size() * sizeof(int32_t));
-      auto day_data = arrow::ArrayData::Make(arrow::date32(), total_ud, {nullptr, day_buf}, 0);
-      auto day_arr = arrow::MakeArray(day_data);
-
-      auto sess_buf = arrow::Buffer::Wrap(b_sess.data(), b_sess.size() * sizeof(int64_t));
-      auto sess_data = arrow::ArrayData::Make(arrow::int64(), total_ud, {nullptr, sess_buf}, 0);
-      auto sess_arr = arrow::MakeArray(sess_data);
-
-      auto evts_buf = arrow::Buffer::Wrap(b_evts.data(), b_evts.size() * sizeof(int64_t));
-      auto evts_data = arrow::ArrayData::Make(arrow::int64(), total_ud, {nullptr, evts_buf}, 0);
-      auto evts_arr = arrow::MakeArray(evts_data);
-
-      auto rev_buf = arrow::Buffer::Wrap(b_rev.data(), b_rev.size() * sizeof(int64_t));
-      auto rev_data = arrow::ArrayData::Make(arrow::int64(), total_ud, {nullptr, rev_buf}, 0);
-      auto rev_arr = arrow::MakeArray(rev_data);
-
-      auto c_bmp_buf = arrow::Buffer::Wrap(b_c_bmp.data(), b_c_bmp.size());
-      auto c_off_buf = arrow::Buffer::Wrap(b_c_off.data(), b_c_off.size() * sizeof(int32_t));
-      auto c_char_buf = arrow::Buffer::Wrap(reinterpret_cast<const uint8_t*>(b_c_chars.data()), b_c_chars.size());
-      auto c_data = arrow::ArrayData::Make(arrow::utf8(), total_ud, {c_bmp_buf, c_off_buf, c_char_buf}, arrow::kUnknownNullCount);
-      auto c_arr = arrow::MakeArray(c_data);
-
-      ud_table = arrow::Table::Make(user_daily_schema, {u_arr, day_arr, sess_arr, evts_arr, rev_arr, c_arr});
-    }
-
-    std::thread t_ud([&]() {
-      std::shared_ptr<arrow::io::FileOutputStream> out;
-      auto res = arrow::io::FileOutputStream::Open(output_dir + "/user_daily/part-0.parquet");
-      if (res.ok()) {
-        out = *res;
-        parquet::WriterProperties::Builder prop_b;
-        prop_b.compression(arrow::Compression::SNAPPY);
-        prop_b.disable_dictionary();
-        auto props = prop_b.build();
-        auto arrow_props = parquet::ArrowWriterProperties::Builder().build();
-        (void)parquet::arrow::WriteTable(*ud_table, arrow::default_memory_pool(), out, 524288, props, arrow_props);
-      }
-    });
-
-    // 2. Build and write campaign_daily
+  // 2. Write _cd.bin
+  {
     size_t total_cd = 0;
     size_t cid_chars_len = 0;
     size_t chn_chars_len = 0;
@@ -1780,16 +1732,16 @@ int main(int argc, char *argv[]) {
       }
     }
 
-    std::vector<int32_t> b_days_cd;
-    b_days_cd.reserve(total_cd);
-    std::vector<int64_t> b_sess_cd;
-    b_sess_cd.reserve(total_cd);
-    std::vector<int64_t> b_psess_cd;
-    b_psess_cd.reserve(total_cd);
-    std::vector<int64_t> b_rev_cd;
-    b_rev_cd.reserve(total_cd);
-    std::vector<int64_t> b_asst_cd;
-    b_asst_cd.reserve(total_cd);
+    std::vector<int32_t> b_days;
+    b_days.reserve(total_cd);
+    std::vector<int64_t> b_sess;
+    b_sess.reserve(total_cd);
+    std::vector<int64_t> b_psess;
+    b_psess.reserve(total_cd);
+    std::vector<int64_t> b_rev;
+    b_rev.reserve(total_cd);
+    std::vector<int64_t> b_asst;
+    b_asst.reserve(total_cd);
 
     std::vector<int32_t> b_cid_off;
     b_cid_off.reserve(total_cd + 1);
@@ -1808,11 +1760,11 @@ int main(int argc, char *argv[]) {
       for (int d = 0; d < num_window_days; ++d) {
         const auto &cd = merged_camp_day[c * num_window_days + d];
         if (cd.sessions > 0 || cd.assisted > 0) {
-          b_days_cd.push_back(win_start_day + d);
-          b_sess_cd.push_back(cd.sessions);
-          b_psess_cd.push_back(cd.purchasing);
-          b_rev_cd.push_back(cd.revenue);
-          b_asst_cd.push_back(cd.assisted);
+          b_days.push_back(win_start_day + d);
+          b_sess.push_back(cd.sessions);
+          b_psess.push_back(cd.purchasing);
+          b_rev.push_back(cd.revenue);
+          b_asst.push_back(cd.assisted);
 
           b_cid_chars.append(camp_list[c].first);
           b_cid_off.push_back(static_cast<int32_t>(b_cid_chars.size()));
@@ -1823,80 +1775,38 @@ int main(int argc, char *argv[]) {
       }
     }
 
-    auto camp_daily_schema = arrow::schema({
-        arrow::field("campaign_id", arrow::utf8(), false),
-        arrow::field("channel", arrow::utf8(), false),
-        arrow::field("day", arrow::date32(), false),
-        arrow::field("sessions", arrow::int64(), false),
-        arrow::field("purchasing_sessions", arrow::int64(), false),
-        arrow::field("revenue_cents", arrow::int64(), false),
-        arrow::field("assisted_sessions", arrow::int64(), false)
-    });
+    uint64_t header[4] = {static_cast<uint64_t>(total_cd),
+                          static_cast<uint64_t>(b_cid_chars.size()),
+                          static_cast<uint64_t>(b_chn_chars.size()), 0};
 
-    std::shared_ptr<arrow::Table> cd_table;
-    if (total_cd == 0) {
-      arrow::StringBuilder cid_b, chn_b;
-      arrow::Date32Builder day_b;
-      arrow::Int64Builder sess_b, psess_b, rev_b, asst_b;
-      std::shared_ptr<arrow::Array> cid_a, chn_a, day_a, sess_a, psess_a, rev_a, asst_a;
-      (void)cid_b.Finish(&cid_a);
-      (void)chn_b.Finish(&chn_a);
-      (void)day_b.Finish(&day_a);
-      (void)sess_b.Finish(&sess_a);
-      (void)psess_b.Finish(&psess_a);
-      (void)rev_b.Finish(&rev_a);
-      (void)asst_b.Finish(&asst_a);
-      cd_table = arrow::Table::Make(camp_daily_schema, {cid_a, chn_a, day_a, sess_a, psess_a, rev_a, asst_a});
-    } else {
-      auto cid_off_buf = arrow::Buffer::Wrap(b_cid_off.data(), b_cid_off.size() * sizeof(int32_t));
-      auto cid_char_buf = arrow::Buffer::Wrap(reinterpret_cast<const uint8_t*>(b_cid_chars.data()), b_cid_chars.size());
-      auto cid_data = arrow::ArrayData::Make(arrow::utf8(), total_cd, {nullptr, cid_off_buf, cid_char_buf}, 0);
-      auto cid_arr = arrow::MakeArray(cid_data);
+    std::ofstream out(scratch_dir + "/_cd.bin", std::ios::binary);
+    out.write(reinterpret_cast<const char *>(header), sizeof(header));
+    out.write(reinterpret_cast<const char *>(b_days.data()),
+              b_days.size() * sizeof(int32_t));
+    out.write(reinterpret_cast<const char *>(b_sess.data()),
+              b_sess.size() * sizeof(int64_t));
+    out.write(reinterpret_cast<const char *>(b_psess.data()),
+              b_psess.size() * sizeof(int64_t));
+    out.write(reinterpret_cast<const char *>(b_rev.data()),
+              b_rev.size() * sizeof(int64_t));
+    out.write(reinterpret_cast<const char *>(b_asst.data()),
+              b_asst.size() * sizeof(int64_t));
+    out.write(reinterpret_cast<const char *>(b_cid_off.data()),
+              b_cid_off.size() * sizeof(int32_t));
+    out.write(b_cid_chars.data(), b_cid_chars.size());
+    out.write(reinterpret_cast<const char *>(b_chn_off.data()),
+              b_chn_off.size() * sizeof(int32_t));
+    out.write(b_chn_chars.data(), b_chn_chars.size());
+    out.flush();
+    out.close();
+  }
 
-      auto chn_off_buf = arrow::Buffer::Wrap(b_chn_off.data(), b_chn_off.size() * sizeof(int32_t));
-      auto chn_char_buf = arrow::Buffer::Wrap(reinterpret_cast<const uint8_t*>(b_chn_chars.data()), b_chn_chars.size());
-      auto chn_data = arrow::ArrayData::Make(arrow::utf8(), total_cd, {nullptr, chn_off_buf, chn_char_buf}, 0);
-      auto chn_arr = arrow::MakeArray(chn_data);
-
-      auto day_buf = arrow::Buffer::Wrap(b_days_cd.data(), b_days_cd.size() * sizeof(int32_t));
-      auto day_data = arrow::ArrayData::Make(arrow::date32(), total_cd, {nullptr, day_buf}, 0);
-      auto day_arr = arrow::MakeArray(day_data);
-
-      auto sess_buf = arrow::Buffer::Wrap(b_sess_cd.data(), b_sess_cd.size() * sizeof(int64_t));
-      auto sess_data = arrow::ArrayData::Make(arrow::int64(), total_cd, {nullptr, sess_buf}, 0);
-      auto sess_arr = arrow::MakeArray(sess_data);
-
-      auto psess_buf = arrow::Buffer::Wrap(b_psess_cd.data(), b_psess_cd.size() * sizeof(int64_t));
-      auto psess_data = arrow::ArrayData::Make(arrow::int64(), total_cd, {nullptr, psess_buf}, 0);
-      auto psess_arr = arrow::MakeArray(psess_data);
-
-      auto rev_buf = arrow::Buffer::Wrap(b_rev_cd.data(), b_rev_cd.size() * sizeof(int64_t));
-      auto rev_data = arrow::ArrayData::Make(arrow::int64(), total_cd, {nullptr, rev_buf}, 0);
-      auto rev_arr = arrow::MakeArray(rev_data);
-
-      auto asst_buf = arrow::Buffer::Wrap(b_asst_cd.data(), b_asst_cd.size() * sizeof(int64_t));
-      auto asst_data = arrow::ArrayData::Make(arrow::int64(), total_cd, {nullptr, asst_buf}, 0);
-      auto asst_arr = arrow::MakeArray(asst_data);
-
-      cd_table = arrow::Table::Make(camp_daily_schema, {cid_arr, chn_arr, day_arr, sess_arr, psess_arr, rev_arr, asst_arr});
-    }
-
-    std::thread t_cd([&]() {
-      std::shared_ptr<arrow::io::FileOutputStream> out;
-      auto res = arrow::io::FileOutputStream::Open(output_dir + "/campaign_daily/part-0.parquet");
-      if (res.ok()) {
-        out = *res;
-        parquet::WriterProperties::Builder prop_b;
-        prop_b.compression(arrow::Compression::SNAPPY);
-        prop_b.disable_dictionary();
-        auto props = prop_b.build();
-        auto arrow_props = parquet::ArrowWriterProperties::Builder().build();
-        (void)parquet::arrow::WriteTable(*cd_table, arrow::default_memory_pool(), out, 524288, props, arrow_props);
-      }
-    });
-
-    t_ud.join();
-    t_cd.join();
+  // Write ready flag to notify write_parquet.py
+  {
+    std::ofstream flag(scratch_dir + "/_ready.flag");
+    flag.put('1');
+    flag.flush();
+    flag.close();
   }
 
   return 0;
