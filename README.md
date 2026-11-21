@@ -18,9 +18,10 @@ It implements the complete specification from `rules.md`, strictly passing all 3
 
 ## Repository Layout
 
-- `Dockerfile`: Multi-stage / optimized build for `linux/amd64` (Intel Xeon Cascade Lake or newer).
+- `Dockerfile`: Multi-stage / optimized build for `linux/amd64` using `python:3.12-slim-bookworm`.
 - `run.sh`: Scorer entrypoint running as uid 1000 with read-only root and `/scratch` temp directory.
-- `src/pipeline.cpp`: Complete C++20 pipeline engine.
+- `src/engine.cpp`: Pure C++20 multi-threaded parsing, sessionization, and aggregation engine.
+- `src/write_parquet.py`: PyArrow writer emitting Parquet tables with exact schema.
 - `fixtures/`: The 36 edge-case specification fixtures (`A1`–`A12`, `E1`–`E20`, `L1`–`L4`).
 - `scripts/`: Fixture runner and output comparator.
 - `rules.md`: Complete rules and dataset specification.

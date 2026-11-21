@@ -14,11 +14,7 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <thread>
-#include <future>
-
-#include <arrow/api.h>
-#include <arrow/io/api.h>
-#include <parquet/arrow/writer.h>
+#include <atomic>
 
 namespace fs = std::filesystem;
 
@@ -256,7 +252,7 @@ struct RawEventRecord {
 
 struct EventItem {
     int64_t ts;
-    uint8_t type; // 0: view, 1: cart, 2: purchase
+    uint8_t type;
     int64_t price_cents;
     std::string category;
 };
@@ -307,12 +303,9 @@ int main(int argc, char* argv[]) {
     std::cin.tie(NULL);
 
     std::string data_dir = "/data";
-    std::string out_dir = "/output";
-    if (const char* env_d = getenv("DATA_DIR")) data_dir = env_d;
-    else if (argc > 1) data_dir = argv[1];
-
-    if (const char* env_o = getenv("OUTPUT_DIR")) out_dir = env_o;
-    else if (argc > 2) out_dir = argv[2];
+    std::string scratch_dir = "/scratch";
+    if (argc > 1) data_dir = argv[1];
+    if (argc > 2) scratch_dir = argv[2];
 
     size_t num_threads = std::thread::hardware_concurrency();
     if (const char* env_ncpu = getenv("NCPU")) {
@@ -436,7 +429,6 @@ int main(int argc, char* argv[]) {
     }
 
     // 5. Read events/*.csv
-    // Sort event files by size descending for optimal thread load-balancing
     std::vector<std::pair<size_t, std::string>> ev_files_with_size;
     if (fs::is_directory(data_dir + "/events")) {
         for (const auto& entry : fs::directory_iterator(data_dir + "/events")) {
@@ -448,8 +440,6 @@ int main(int argc, char* argv[]) {
     std::sort(ev_files_with_size.rbegin(), ev_files_with_size.rend());
 
     const size_t NUM_SHARDS = 64;
-    // Thread-local shard buffers: [thread_id][shard_id] -> vector of RawEventRecord
-    // This allows 100% lock-free file reading!
     std::vector<std::vector<std::vector<std::pair<std::string, RawEventRecord>>>> thread_event_shards(
         num_threads, std::vector<std::vector<std::pair<std::string, RawEventRecord>>>(NUM_SHARDS)
     );
@@ -506,8 +496,7 @@ int main(int argc, char* argv[]) {
         for (auto& w : workers) w.join();
     }
 
-    // 6. Deduplicate & Validate events per shard, and partition into person_shards
-    // Lock-free: thread-local person shards [thread_id][person_shard]
+    // 6. Deduplicate & Validate events
     std::vector<std::vector<std::unordered_map<std::string, std::vector<EventItem>>>> thread_person_events(
         num_threads, std::vector<std::unordered_map<std::string, std::vector<EventItem>>>(NUM_SHARDS)
     );
@@ -523,7 +512,6 @@ int main(int argc, char* argv[]) {
                     size_t s = shard_idx.fetch_add(1);
                     if (s >= NUM_SHARDS) break;
 
-                    // Merge across all threads for this shard s
                     std::unordered_map<std::string, RawEventRecord> smap;
                     for (size_t th = 0; th < num_threads; ++th) {
                         for (auto& [eid, raw] : thread_event_shards[th][s]) {
@@ -533,10 +521,8 @@ int main(int argc, char* argv[]) {
                             }
                         }
                         thread_event_shards[th][s].clear();
-                        thread_event_shards[th][s].shrink_to_fit();
                     }
 
-                    // Validate kept events
                     for (auto& [eid, raw] : smap) {
                         if (raw.user_id.empty()) continue;
                         int64_t ts_ms = 0;
@@ -586,9 +572,8 @@ int main(int argc, char* argv[]) {
         for (auto& w : workers) w.join();
     }
     thread_event_shards.clear();
-    thread_event_shards.shrink_to_fit();
 
-    // 7. Read clicks/*.csv in parallel
+    // 7. Read clicks/*.csv
     std::vector<std::pair<size_t, std::string>> clk_files_with_size;
     if (fs::is_directory(data_dir + "/clicks")) {
         for (const auto& entry : fs::directory_iterator(data_dir + "/clicks")) {
@@ -650,7 +635,7 @@ int main(int argc, char* argv[]) {
         for (auto& w : workers) w.join();
     }
 
-    // 8. Deduplicate & Validate clicks per shard, and partition into person_shards
+    // 8. Deduplicate & Validate clicks
     std::vector<std::vector<std::unordered_map<std::string, std::vector<ClickItem>>>> thread_person_clicks(
         num_threads, std::vector<std::unordered_map<std::string, std::vector<ClickItem>>>(NUM_SHARDS)
     );
@@ -674,7 +659,6 @@ int main(int argc, char* argv[]) {
                             }
                         }
                         thread_click_shards[th][s].clear();
-                        thread_click_shards[th][s].shrink_to_fit();
                     }
 
                     for (auto& [cid, raw] : cmap) {
@@ -700,7 +684,6 @@ int main(int argc, char* argv[]) {
         for (auto& w : workers) w.join();
     }
     thread_click_shards.clear();
-    thread_click_shards.shrink_to_fit();
 
     // 9. Sessionize and Aggregate per person shard
     std::vector<std::unordered_map<AggKey, UserDailyStats, AggKeyHash>> final_user_daily(NUM_SHARDS);
@@ -721,7 +704,6 @@ int main(int argc, char* argv[]) {
                     size_t ps = pshard_idx.fetch_add(1);
                     if (ps >= NUM_SHARDS) break;
 
-                    // Merge events for person_shard ps
                     std::unordered_map<std::string, std::vector<EventItem>> person_events;
                     for (size_t th = 0; th < num_threads; ++th) {
                         for (auto& [pid, evs] : thread_person_events[th][ps]) {
@@ -731,7 +713,6 @@ int main(int argc, char* argv[]) {
                         thread_person_events[th][ps].clear();
                     }
 
-                    // Merge clicks for person_shard ps
                     std::unordered_map<std::string, std::vector<ClickItem>> person_clicks;
                     for (size_t th = 0; th < num_threads; ++th) {
                         for (auto& [pid, cls] : thread_person_clicks[th][ps]) {
@@ -741,7 +722,6 @@ int main(int argc, char* argv[]) {
                         thread_person_clicks[th][ps].clear();
                     }
 
-                    // Sort clicks for each person
                     for (auto& [pid, clist] : person_clicks) {
                         std::sort(clist.begin(), clist.end(), [](const ClickItem& a, const ClickItem& b) {
                             if (a.ts != b.ts) return a.ts < b.ts;
@@ -869,32 +849,22 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    // 10. Write user_daily Parquet
-    fs::create_directories(out_dir + "/user_daily");
-    fs::create_directories(out_dir + "/campaign_daily");
-
+    // Write clean TSV files into scratch_dir
+    fs::create_directories(scratch_dir);
     {
-        arrow::StringBuilder user_id_b;
-        arrow::Date32Builder day_b;
-        arrow::Int64Builder sessions_b;
-        arrow::Int64Builder events_b;
-        arrow::Int64Builder rev_b;
-        arrow::StringBuilder top_cat_b;
-
+        std::ofstream out_ud(scratch_dir + "/_ud.tsv");
         for (size_t s = 0; s < NUM_SHARDS; ++s) {
             for (auto& [key, stats] : final_user_daily[s]) {
                 std::string p_id = key.id;
                 int32_t s_day = key.day;
 
                 std::string top_cat = "";
-                bool has_top_cat = false;
                 if (!stats.cat_rev.empty()) {
                     int64_t best_rev = -1;
                     for (auto& [cat, rev] : stats.cat_rev) {
                         if (rev > best_rev) {
                             best_rev = rev;
                             top_cat = cat;
-                            has_top_cat = true;
                         } else if (rev == best_rev) {
                             if (cat < top_cat) {
                                 top_cat = cat;
@@ -903,52 +873,14 @@ int main(int argc, char* argv[]) {
                     }
                 }
 
-                (void)user_id_b.Append(p_id);
-                (void)day_b.Append(s_day);
-                (void)sessions_b.Append(stats.sessions);
-                (void)events_b.Append(stats.events);
-                (void)rev_b.Append(stats.revenue_cents);
-                if (has_top_cat) {
-                    (void)top_cat_b.Append(top_cat);
-                } else {
-                    (void)top_cat_b.AppendNull();
-                }
+                out_ud << p_id << '\t' << s_day << '\t' << stats.sessions << '\t'
+                       << stats.events << '\t' << stats.revenue_cents << '\t' << top_cat << '\n';
             }
         }
-
-        std::shared_ptr<arrow::Array> u_arr, d_arr, s_arr, e_arr, r_arr, t_arr;
-        (void)user_id_b.Finish(&u_arr);
-        (void)day_b.Finish(&d_arr);
-        (void)sessions_b.Finish(&s_arr);
-        (void)events_b.Finish(&e_arr);
-        (void)rev_b.Finish(&r_arr);
-        (void)top_cat_b.Finish(&t_arr);
-
-        auto schema = arrow::schema({
-            arrow::field("user_id", arrow::utf8()),
-            arrow::field("day", arrow::date32()),
-            arrow::field("sessions", arrow::int64()),
-            arrow::field("events", arrow::int64()),
-            arrow::field("revenue_cents", arrow::int64()),
-            arrow::field("top_category", arrow::utf8())
-        });
-
-        auto table = arrow::Table::Make(schema, {u_arr, d_arr, s_arr, e_arr, r_arr, t_arr});
-        std::shared_ptr<arrow::io::FileOutputStream> outfile;
-        PARQUET_ASSIGN_OR_THROW(outfile, arrow::io::FileOutputStream::Open(out_dir + "/user_daily/part-0.parquet"));
-        PARQUET_THROW_NOT_OK(parquet::arrow::WriteTable(*table, arrow::default_memory_pool(), outfile, 1024 * 1024));
     }
 
-    // 11. Write campaign_daily Parquet
     {
-        arrow::StringBuilder camp_id_b;
-        arrow::StringBuilder channel_b;
-        arrow::Date32Builder day_b;
-        arrow::Int64Builder sessions_b;
-        arrow::Int64Builder purchasing_sessions_b;
-        arrow::Int64Builder rev_b;
-        arrow::Int64Builder assisted_sessions_b;
-
+        std::ofstream out_cd(scratch_dir + "/_cd.tsv");
         for (auto& [key, stats] : merged_campaign_daily) {
             std::string c_id = key.id;
             int32_t s_day = key.day;
@@ -959,38 +891,10 @@ int main(int argc, char* argv[]) {
                 if (it != campaigns.end()) channel = it->second;
             }
 
-            (void)camp_id_b.Append(c_id);
-            (void)channel_b.Append(channel);
-            (void)day_b.Append(s_day);
-            (void)sessions_b.Append(stats.sessions);
-            (void)purchasing_sessions_b.Append(stats.purchasing_sessions);
-            (void)rev_b.Append(stats.revenue_cents);
-            (void)assisted_sessions_b.Append(stats.assisted_sessions);
+            out_cd << c_id << '\t' << channel << '\t' << s_day << '\t'
+                   << stats.sessions << '\t' << stats.purchasing_sessions << '\t'
+                   << stats.revenue_cents << '\t' << stats.assisted_sessions << '\n';
         }
-
-        std::shared_ptr<arrow::Array> c_arr, ch_arr, d_arr, s_arr, ps_arr, r_arr, as_arr;
-        (void)camp_id_b.Finish(&c_arr);
-        (void)channel_b.Finish(&ch_arr);
-        (void)day_b.Finish(&d_arr);
-        (void)sessions_b.Finish(&s_arr);
-        (void)purchasing_sessions_b.Finish(&ps_arr);
-        (void)rev_b.Finish(&r_arr);
-        (void)assisted_sessions_b.Finish(&as_arr);
-
-        auto schema = arrow::schema({
-            arrow::field("campaign_id", arrow::utf8()),
-            arrow::field("channel", arrow::utf8()),
-            arrow::field("day", arrow::date32()),
-            arrow::field("sessions", arrow::int64()),
-            arrow::field("purchasing_sessions", arrow::int64()),
-            arrow::field("revenue_cents", arrow::int64()),
-            arrow::field("assisted_sessions", arrow::int64())
-        });
-
-        auto table = arrow::Table::Make(schema, {c_arr, ch_arr, d_arr, s_arr, ps_arr, r_arr, as_arr});
-        std::shared_ptr<arrow::io::FileOutputStream> outfile;
-        PARQUET_ASSIGN_OR_THROW(outfile, arrow::io::FileOutputStream::Open(out_dir + "/campaign_daily/part-0.parquet"));
-        PARQUET_THROW_NOT_OK(parquet::arrow::WriteTable(*table, arrow::default_memory_pool(), outfile, 1024 * 1024));
     }
 
     return 0;
