@@ -1,0 +1,14 @@
+.venv/
+bin/
+dev/
+dev-answer/
+out/
+*.parquet
+.DS_Store
+__pycache__/
+pipeline_ref.py
+src/pipeline_fast.cpp
+starter-pyspark/
+
+
+

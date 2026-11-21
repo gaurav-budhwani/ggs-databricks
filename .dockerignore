@@ -1,0 +1,9 @@
+.git
+.venv
+bin
+dev
+dev-answer
+*.parquet
+*.csv
+.DS_Store
+
