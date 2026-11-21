@@ -32,6 +32,25 @@ static inline int64_t days_from_civil(int y, unsigned m, unsigned d) noexcept {
     return era * 146097 + static_cast<int64_t>(doe) - 719468;
 }
 
+static int64_t CIVIL_DAYS_LOOKUP[8][13][32]; // [year - 2024][month][day]
+
+static void init_civil_lookup() noexcept {
+    for (int y = 2024; y <= 2030; ++y) {
+        for (unsigned m = 1; m <= 12; ++m) {
+            for (unsigned d = 1; d <= 31; ++d) {
+                CIVIL_DAYS_LOOKUP[y - 2024][m][d] = days_from_civil(y, m, d);
+            }
+        }
+    }
+}
+
+static inline int64_t days_from_civil_fast(int y, unsigned m, unsigned d) noexcept {
+    if (y >= 2024 && y <= 2030 && m >= 1 && m <= 12 && d >= 1 && d <= 31) {
+        return CIVIL_DAYS_LOOKUP[y - 2024][m][d];
+    }
+    return days_from_civil(y, m, d);
+}
+
 static inline bool parse_iso_f1(std::string_view s, int64_t& out_ms) noexcept {
     if (s.size() != 20 || s[10] != 'T' || s[19] != 'Z') return false;
     if (s[4] != '-' || s[7] != '-' || s[13] != ':' || s[16] != ':') return false;
@@ -51,9 +70,24 @@ static inline bool parse_iso_f1(std::string_view s, int64_t& out_ms) noexcept {
     int S = (s[17] - '0') * 10 + (s[18] - '0');
     if (S < 0 || S > 59) return false;
 
-    int64_t epoch_sec = days_from_civil(y, m, d) * 86400 + H * 3600 + M * 60 + S;
+    int64_t epoch_sec = days_from_civil_fast(y, m, d) * 86400 + H * 3600 + M * 60 + S;
     out_ms = epoch_sec * 1000;
     return true;
+}
+
+static inline bool parse_ingest_ts(std::string_view s, int64_t& out_ms) noexcept {
+    if (__builtin_expect(s.size() == 20 && s[10] == 'T' && s[19] == 'Z', 1)) {
+        int y = (s[0] - '0') * 1000 + (s[1] - '0') * 100 + (s[2] - '0') * 10 + (s[3] - '0');
+        int m = (s[5] - '0') * 10 + (s[6] - '0');
+        int d = (s[8] - '0') * 10 + (s[9] - '0');
+        int H = (s[11] - '0') * 10 + (s[12] - '0');
+        int M = (s[14] - '0') * 10 + (s[15] - '0');
+        int S = (s[17] - '0') * 10 + (s[18] - '0');
+        int64_t epoch_sec = days_from_civil_fast(y, m, d) * 86400 + H * 3600 + M * 60 + S;
+        out_ms = epoch_sec * 1000;
+        return true;
+    }
+    return parse_iso_f1(s, out_ms);
 }
 
 static inline bool parse_iso_f2(std::string_view s, int64_t& out_ms) noexcept {
@@ -83,7 +117,7 @@ static inline bool parse_iso_f2(std::string_view s, int64_t& out_ms) noexcept {
     int off_m = (s[23] - '0') * 10 + (s[24] - '0');
     if (off_m < 0 || off_m > 59) return false;
 
-    int64_t epoch_sec = days_from_civil(y, m, d) * 86400 + H * 3600 + M * 60 + S;
+    int64_t epoch_sec = days_from_civil_fast(y, m, d) * 86400 + H * 3600 + M * 60 + S;
     int64_t base_ms = epoch_sec * 1000;
     int64_t off_ms = (static_cast<int64_t>(off_h) * 3600 + off_m * 60) * 1000;
     out_ms = (sign == '+') ? (base_ms - off_ms) : (base_ms + off_ms);
@@ -94,17 +128,21 @@ enum class TsStatus { VALID, OUT_OF_BOUNDS, BAD };
 
 static inline TsStatus parse_ts(std::string_view s, int64_t& out_ms) noexcept {
     if (s.empty()) return TsStatus::BAD;
-    if (s.size() == 20) {
+    size_t sz = s.size();
+    if (sz == 20) {
         if (parse_iso_f1(s, out_ms)) return TsStatus::VALID;
-    } else if (s.size() == 25) {
+    } else if (sz == 25) {
         if (parse_iso_f2(s, out_ms)) return TsStatus::VALID;
     }
-    for (char c : s) {
-        if (c < '0' || c > '9') return TsStatus::BAD;
+    if (sz > 19) {
+        for (char c : s) {
+            if (c < '0' || c > '9') return TsStatus::BAD;
+        }
+        return TsStatus::OUT_OF_BOUNDS;
     }
-    if (s.size() > 19) return TsStatus::OUT_OF_BOUNDS;
     int64_t v = 0;
     for (char c : s) {
+        if (c < '0' || c > '9') return TsStatus::BAD;
         v = v * 10 + (c - '0');
     }
     out_ms = v;
@@ -118,11 +156,17 @@ static inline bool parse_csv_line(std::string_view line, int expected_fields, st
     while (ptr <= end) {
         if (field_idx >= expected_fields) return false;
         const char* f_start = ptr;
-        while (ptr < end && *ptr != ',') ptr++;
+        bool has_quote = false;
+        while (ptr < end && *ptr != ',') {
+            if (*ptr == '"') has_quote = true;
+            ptr++;
+        }
         const char* f_end = ptr;
         size_t len = f_end - f_start;
-        if (len > 0 && *f_start == '"') {
-            if (len >= 2 && *(f_end - 1) == '"') {
+        if (__builtin_expect(!has_quote, 1)) {
+            out_fields[field_idx++] = std::string_view(f_start, len);
+        } else {
+            if (len >= 2 && *f_start == '"' && *(f_end - 1) == '"') {
                 for (const char* p = f_start + 1; p < f_end - 1; ++p) {
                     if (*p == '"') return false;
                 }
@@ -130,11 +174,6 @@ static inline bool parse_csv_line(std::string_view line, int expected_fields, st
             } else {
                 return false;
             }
-        } else {
-            for (const char* p = f_start; p < f_end; ++p) {
-                if (*p == '"') return false;
-            }
-            out_fields[field_idx++] = std::string_view(f_start, len);
         }
         if (ptr == end) break;
         ptr++;
@@ -232,6 +271,12 @@ struct FlatDSU {
     std::vector<uint32_t> parent;
     std::vector<uint32_t> min_id;
     std::vector<uint32_t> canonical_min_id;
+    std::vector<uint64_t> canonical_hash;
+
+    struct CanonicalInfo {
+        std::string_view can_id;
+        uint64_t hash;
+    };
 
     void init(size_t cap) {
         size_t n = 1;
@@ -305,23 +350,27 @@ struct FlatDSU {
 
     void finalize() {
         canonical_min_id.resize(id_to_user.size());
+        canonical_hash.resize(id_to_user.size());
         for (size_t i = 0; i < id_to_user.size(); ++i) {
-            canonical_min_id[i] = min_id[find(static_cast<uint32_t>(i))];
+            uint32_t cid = min_id[find(static_cast<uint32_t>(i))];
+            canonical_min_id[i] = cid;
+            canonical_hash[i] = hash_str(id_to_user[cid]);
         }
     }
 
-    std::string_view get_canonical(std::string_view u) const noexcept {
-        if (mask == 0) return u;
+    CanonicalInfo get_canonical(std::string_view u) const noexcept {
         uint64_t h = hash_str(u);
-        if (h == 0) h = 1;
-        size_t idx = h & mask;
+        if (mask == 0) return {u, h};
+        uint64_t h_key = (h == 0) ? 1 : h;
+        size_t idx = h_key & mask;
         while (table[idx].hash != 0) {
-            if (table[idx].hash == h && id_to_user[table[idx].id] == u) {
-                return id_to_user[canonical_min_id[table[idx].id]];
+            if (table[idx].hash == h_key && id_to_user[table[idx].id] == u) {
+                uint32_t cid = canonical_min_id[table[idx].id];
+                return {id_to_user[cid], canonical_hash[cid]};
             }
             idx = (idx + 1) & mask;
         }
-        return u;
+        return {u, h};
     }
 };
 
@@ -461,7 +510,7 @@ struct FlatCampMap {
     }
 };
 
-// Compact parsed event representation (ZERO HEAP ALLOCATION)
+// Compact parsed event representation
 struct CompactEvent {
     uint64_t eid_hash;
     std::string_view eid;
@@ -516,9 +565,17 @@ struct ShardCdStats {
     int64_t assisted = 0;
 };
 
+struct FileChunk {
+    size_t file_idx;
+    size_t start;
+    size_t end;
+};
+
 int main(int argc, char* argv[]) {
     std::ios_base::sync_with_stdio(false);
     std::cin.tie(NULL);
+
+    init_civil_lookup();
 
     std::string data_dir = "/data";
     std::string scratch_dir = "/scratch";
@@ -671,7 +728,7 @@ int main(int argc, char* argv[]) {
     }
     dsu.finalize();
 
-    // 5. Memory map all events/*.csv files
+    // 5. Memory map all events/*.csv files & create balanced 2MB chunks
     std::vector<std::pair<size_t, std::string>> ev_files_with_size;
     if (fs::is_directory(data_dir + "/events")) {
         for (const auto& entry : fs::directory_iterator(data_dir + "/events")) {
@@ -683,51 +740,78 @@ int main(int argc, char* argv[]) {
     std::sort(ev_files_with_size.rbegin(), ev_files_with_size.rend());
 
     std::vector<MmapFile> ev_mmaps(ev_files_with_size.size());
+    std::vector<FileChunk> ev_chunks;
+    const size_t CHUNK_SIZE = 2 * 1024 * 1024; // 2 MB
+    size_t total_ev_bytes = 0;
+
     for (size_t i = 0; i < ev_files_with_size.size(); ++i) {
         ev_mmaps[i] = MmapFile(ev_files_with_size[i].second);
+        size_t sz = ev_mmaps[i].size;
+        total_ev_bytes += sz;
+        if (sz == 0) continue;
+        for (size_t off = 0; off < sz; off += CHUNK_SIZE) {
+            ev_chunks.push_back({i, off, std::min(off + CHUNK_SIZE, sz)});
+        }
     }
 
-    const size_t NUM_SHARDS = 64;
+    const size_t NUM_SHARDS = 256;
+    size_t est_events = total_ev_bytes / 55 + 1024;
+    size_t est_per_thread_shard = est_events / (num_threads * NUM_SHARDS) + 64;
+
     std::vector<std::vector<std::vector<CompactEvent>>> thread_event_shards(
         num_threads, std::vector<std::vector<CompactEvent>>(NUM_SHARDS)
     );
     for (size_t t = 0; t < num_threads; ++t) {
         for (size_t s = 0; s < NUM_SHARDS; ++s) {
-            thread_event_shards[t][s].reserve(8192);
+            thread_event_shards[t][s].reserve(est_per_thread_shard);
         }
     }
 
     {
         std::vector<std::thread> workers;
-        std::atomic<size_t> file_idx{0};
+        std::atomic<size_t> chunk_idx{0};
 
         for (size_t t = 0; t < num_threads; ++t) {
-            workers.emplace_back([t, &file_idx, &ev_mmaps, &thread_event_shards,
+            workers.emplace_back([t, &chunk_idx, &ev_chunks, &ev_mmaps, &thread_event_shards,
                                   &prod_to_cat, win_start_ms, win_end_ms]() {
                 std::string_view fields[8];
                 while (true) {
-                    size_t idx = file_idx.fetch_add(1);
-                    if (idx >= ev_mmaps.size()) break;
+                    size_t c_idx = chunk_idx.fetch_add(1, std::memory_order_relaxed);
+                    if (c_idx >= ev_chunks.size()) break;
 
-                    const auto& mf = ev_mmaps[idx];
+                    const auto& ch = ev_chunks[c_idx];
+                    const auto& mf = ev_mmaps[ch.file_idx];
                     if (!mf.is_open()) continue;
-                    const char* cur = mf.data;
-                    const char* end = mf.data + mf.size;
-                    while (cur < end && *cur != '\n') cur++;
-                    if (cur < end && *cur == '\n') cur++;
+                    const char* data = mf.data;
+                    size_t sz = mf.size;
 
-                    while (cur < end) {
+                    const char* cur = data + ch.start;
+                    if (ch.start == 0) {
+                        while (cur < data + ch.end && *cur != '\n') cur++;
+                        if (cur < data + ch.end && *cur == '\n') cur++;
+                    } else {
+                        while (cur < data + sz && *cur != '\n') cur++;
+                        if (cur < data + sz && *cur == '\n') cur++;
+                    }
+
+                    const char* actual_end = data + ch.end;
+                    if (ch.end < sz) {
+                        while (actual_end < data + sz && *actual_end != '\n') actual_end++;
+                        if (actual_end < data + sz && *actual_end == '\n') actual_end++;
+                    }
+
+                    while (cur < actual_end) {
                         const char* line_start = cur;
-                        while (cur < end && *cur != '\n') cur++;
+                        while (cur < actual_end && *cur != '\n') cur++;
                         std::string_view line(line_start, cur - line_start);
-                        if (cur < end && *cur == '\n') cur++;
+                        if (cur < actual_end && *cur == '\n') cur++;
 
                         if (parse_csv_line(line, 7, fields)) {
                             std::string_view eid = fields[0];
                             if (eid.empty()) continue;
 
                             int64_t ingest_ts_ms = 0;
-                            if (!parse_iso_f1(fields[3], ingest_ts_ms)) continue;
+                            if (!parse_ingest_ts(fields[3], ingest_ts_ms)) continue;
 
                             // Inline pre-validation of this copy
                             bool valid = true;
@@ -806,7 +890,7 @@ int main(int argc, char* argv[]) {
     );
     for (size_t t = 0; t < num_threads; ++t) {
         for (size_t s = 0; s < NUM_SHARDS; ++s) {
-            thread_person_events[t][s].reserve(8192);
+            thread_person_events[t][s].reserve(est_per_thread_shard);
         }
     }
 
@@ -823,8 +907,10 @@ int main(int argc, char* argv[]) {
                     uint32_t idx = 0;
                 };
 
+                std::vector<DedupEntry> table;
+
                 while (true) {
-                    size_t s = shard_idx.fetch_add(1);
+                    size_t s = shard_idx.fetch_add(1, std::memory_order_relaxed);
                     if (s >= NUM_SHARDS) break;
 
                     size_t total_s = 0;
@@ -836,7 +922,8 @@ int main(int argc, char* argv[]) {
                     if (cap < 64) cap = 64;
                     size_t mask = cap - 1;
 
-                    std::vector<DedupEntry> table(cap, DedupEntry{0, 0, 0});
+                    if (table.size() < cap) table.resize(cap);
+                    std::memset(table.data(), 0, cap * sizeof(DedupEntry));
 
                     for (uint32_t th = 0; th < num_threads; ++th) {
                         const auto& s_vec = thread_event_shards[th][s];
@@ -866,13 +953,12 @@ int main(int argc, char* argv[]) {
                         const auto& ev = thread_event_shards[table[i].th][s][table[i].idx];
                         if (!ev.is_valid) continue;
 
-                        std::string_view can_uid = dsu.get_canonical(ev.user_id);
-                        uint64_t pid_h = hash_str(can_uid);
-                        size_t pshard = pid_h & (NUM_SHARDS - 1);
+                        auto can = dsu.get_canonical(ev.user_id);
+                        size_t pshard = can.hash & (NUM_SHARDS - 1);
 
                         thread_person_events[t][pshard].push_back(PersonEvent{
-                            pid_h,
-                            can_uid,
+                            can.hash,
+                            can.can_id,
                             ev.ts_ms,
                             ev.price_cents,
                             ev.cat_idx,
@@ -886,7 +972,7 @@ int main(int argc, char* argv[]) {
     }
     thread_event_shards.clear();
 
-    // 7. Memory map clicks/*.csv files
+    // 7. Memory map clicks/*.csv files & create balanced 2MB chunks
     std::vector<std::pair<size_t, std::string>> clk_files_with_size;
     if (fs::is_directory(data_dir + "/clicks")) {
         for (const auto& entry : fs::directory_iterator(data_dir + "/clicks")) {
@@ -898,38 +984,69 @@ int main(int argc, char* argv[]) {
     std::sort(clk_files_with_size.rbegin(), clk_files_with_size.rend());
 
     std::vector<MmapFile> clk_mmaps(clk_files_with_size.size());
+    std::vector<FileChunk> clk_chunks;
+    size_t total_clk_bytes = 0;
+
     for (size_t i = 0; i < clk_files_with_size.size(); ++i) {
         clk_mmaps[i] = MmapFile(clk_files_with_size[i].second);
+        size_t sz = clk_mmaps[i].size;
+        total_clk_bytes += sz;
+        if (sz == 0) continue;
+        for (size_t off = 0; off < sz; off += CHUNK_SIZE) {
+            clk_chunks.push_back({i, off, std::min(off + CHUNK_SIZE, sz)});
+        }
     }
+
+    size_t est_clicks = total_clk_bytes / 45 + 1024;
+    size_t est_per_thread_clk = est_clicks / (num_threads * NUM_SHARDS) + 16;
 
     std::vector<std::vector<std::vector<CompactClick>>> thread_click_shards(
         num_threads, std::vector<std::vector<CompactClick>>(NUM_SHARDS)
     );
+    for (size_t t = 0; t < num_threads; ++t) {
+        for (size_t s = 0; s < NUM_SHARDS; ++s) {
+            thread_click_shards[t][s].reserve(est_per_thread_clk);
+        }
+    }
 
     {
         std::vector<std::thread> workers;
-        std::atomic<size_t> file_idx{0};
+        std::atomic<size_t> chunk_idx{0};
 
         for (size_t t = 0; t < num_threads; ++t) {
-            workers.emplace_back([t, &file_idx, &clk_mmaps, &thread_click_shards,
+            workers.emplace_back([t, &chunk_idx, &clk_chunks, &clk_mmaps, &thread_click_shards,
                                   &camp_to_idx, click_win_start_ms, win_end_ms]() {
                 std::string_view fields[8];
                 while (true) {
-                    size_t idx = file_idx.fetch_add(1);
-                    if (idx >= clk_mmaps.size()) break;
+                    size_t c_idx = chunk_idx.fetch_add(1, std::memory_order_relaxed);
+                    if (c_idx >= clk_chunks.size()) break;
 
-                    const auto& mf = clk_mmaps[idx];
+                    const auto& ch = clk_chunks[c_idx];
+                    const auto& mf = clk_mmaps[ch.file_idx];
                     if (!mf.is_open()) continue;
-                    const char* cur = mf.data;
-                    const char* end = mf.data + mf.size;
-                    while (cur < end && *cur != '\n') cur++;
-                    if (cur < end && *cur == '\n') cur++;
+                    const char* data = mf.data;
+                    size_t sz = mf.size;
 
-                    while (cur < end) {
+                    const char* cur = data + ch.start;
+                    if (ch.start == 0) {
+                        while (cur < data + ch.end && *cur != '\n') cur++;
+                        if (cur < data + ch.end && *cur == '\n') cur++;
+                    } else {
+                        while (cur < data + sz && *cur != '\n') cur++;
+                        if (cur < data + sz && *cur == '\n') cur++;
+                    }
+
+                    const char* actual_end = data + ch.end;
+                    if (ch.end < sz) {
+                        while (actual_end < data + sz && *actual_end != '\n') actual_end++;
+                        if (actual_end < data + sz && *actual_end == '\n') actual_end++;
+                    }
+
+                    while (cur < actual_end) {
                         const char* line_start = cur;
-                        while (cur < end && *cur != '\n') cur++;
+                        while (cur < actual_end && *cur != '\n') cur++;
                         std::string_view line(line_start, cur - line_start);
-                        if (cur < end && *cur == '\n') cur++;
+                        if (cur < actual_end && *cur == '\n') cur++;
 
                         if (parse_csv_line(line, 4, fields)) {
                             std::string_view cid = fields[0];
@@ -938,10 +1055,10 @@ int main(int argc, char* argv[]) {
                             bool valid = true;
                             if (fields[1].empty()) valid = false;
 
-                            uint16_t c_idx = 0;
+                            uint16_t c_idx_val = 0;
                             if (valid) {
-                                c_idx = camp_to_idx.find(fields[2]);
-                                if (c_idx == 0) valid = false;
+                                c_idx_val = camp_to_idx.find(fields[2]);
+                                if (c_idx_val == 0) valid = false;
                             }
 
                             int64_t ts_ms = 0;
@@ -959,7 +1076,7 @@ int main(int argc, char* argv[]) {
                                 cid,
                                 ts_ms,
                                 fields[1],
-                                c_idx,
+                                c_idx_val,
                                 static_cast<uint8_t>(valid ? 1 : 0)
                             });
                         }
@@ -974,6 +1091,11 @@ int main(int argc, char* argv[]) {
     std::vector<std::vector<std::vector<PersonClick>>> thread_person_clicks(
         num_threads, std::vector<std::vector<PersonClick>>(NUM_SHARDS)
     );
+    for (size_t t = 0; t < num_threads; ++t) {
+        for (size_t s = 0; s < NUM_SHARDS; ++s) {
+            thread_person_clicks[t][s].reserve(est_per_thread_clk);
+        }
+    }
 
     {
         std::vector<std::thread> workers;
@@ -988,8 +1110,10 @@ int main(int argc, char* argv[]) {
                     uint32_t idx = 0;
                 };
 
+                std::vector<ClickDedupEntry> table;
+
                 while (true) {
-                    size_t s = shard_idx.fetch_add(1);
+                    size_t s = shard_idx.fetch_add(1, std::memory_order_relaxed);
                     if (s >= NUM_SHARDS) break;
 
                     size_t total_c = 0;
@@ -1001,7 +1125,8 @@ int main(int argc, char* argv[]) {
                     if (cap < 64) cap = 64;
                     size_t mask = cap - 1;
 
-                    std::vector<ClickDedupEntry> table(cap, ClickDedupEntry{0, 0, 0});
+                    if (table.size() < cap) table.resize(cap);
+                    std::memset(table.data(), 0, cap * sizeof(ClickDedupEntry));
 
                     for (uint32_t th = 0; th < num_threads; ++th) {
                         const auto& s_vec = thread_click_shards[th][s];
@@ -1027,13 +1152,12 @@ int main(int argc, char* argv[]) {
                         const auto& clk = thread_click_shards[table[i].th][s][table[i].idx];
                         if (!clk.is_valid) continue;
 
-                        std::string_view can_uid = dsu.get_canonical(clk.user_id);
-                        uint64_t pid_h = hash_str(can_uid);
-                        size_t pshard = pid_h & (NUM_SHARDS - 1);
+                        auto can = dsu.get_canonical(clk.user_id);
+                        size_t pshard = can.hash & (NUM_SHARDS - 1);
 
                         thread_person_clicks[t][pshard].push_back(PersonClick{
-                            pid_h,
-                            can_uid,
+                            can.hash,
+                            can.can_id,
                             clk.ts_ms,
                             clk.cid,
                             clk.camp_idx
@@ -1063,7 +1187,7 @@ int main(int argc, char* argv[]) {
         for (size_t t = 0; t < num_threads; ++t) {
             workers.emplace_back([&pshard_idx, &thread_person_events, &thread_person_clicks,
                                   &shard_user_daily_rows, &shard_camp_stats,
-                                  &cat_names, &camp_list, num_threads, SEVEN_DAYS, THIRTY_MINS,
+                                  &cat_names, num_threads,
                                   win_start_day, num_window_days, num_cats]() {
                 struct UdStats {
                     int64_t sessions = 0;
@@ -1076,8 +1200,11 @@ int main(int argc, char* argv[]) {
                 std::vector<int> visited_days;
                 visited_days.reserve(32);
 
+                std::vector<PersonEvent> ps_events;
+                std::vector<PersonClick> ps_clicks;
+
                 while (true) {
-                    size_t ps = pshard_idx.fetch_add(1);
+                    size_t ps = pshard_idx.fetch_add(1, std::memory_order_relaxed);
                     if (ps >= NUM_SHARDS) break;
 
                     auto& my_camp_stats = shard_camp_stats[ps];
@@ -1085,7 +1212,7 @@ int main(int argc, char* argv[]) {
                     // Flatten and sort events for this shard by (pid_hash, person_id, ts)
                     size_t total_ev = 0;
                     for (size_t th = 0; th < num_threads; ++th) total_ev += thread_person_events[th][ps].size();
-                    std::vector<PersonEvent> ps_events;
+                    ps_events.clear();
                     ps_events.reserve(total_ev);
                     for (size_t th = 0; th < num_threads; ++th) {
                         ps_events.insert(ps_events.end(), thread_person_events[th][ps].begin(), thread_person_events[th][ps].end());
@@ -1100,7 +1227,7 @@ int main(int argc, char* argv[]) {
                     // Flatten and sort clicks for this shard by (pid_hash, person_id, ts, cid)
                     size_t total_cl = 0;
                     for (size_t th = 0; th < num_threads; ++th) total_cl += thread_person_clicks[th][ps].size();
-                    std::vector<PersonClick> ps_clicks;
+                    ps_clicks.clear();
                     ps_clicks.reserve(total_cl);
                     for (size_t th = 0; th < num_threads; ++th) {
                         ps_clicks.insert(ps_clicks.end(), thread_person_clicks[th][ps].begin(), thread_person_clicks[th][ps].end());
@@ -1179,7 +1306,9 @@ int main(int argc, char* argv[]) {
                             ud.revenue += s_revenue;
 
                             uint16_t cred_camp_idx = 0; // organic
-                            std::vector<uint16_t> asst_list;
+                            uint16_t asst_buf[256];
+                            size_t asst_count = 0;
+                            std::vector<uint16_t> asst_overflow;
 
                             if (clk_start < clk_end) {
                                 int64_t min_clk = s_start - SEVEN_DAYS;
@@ -1195,7 +1324,11 @@ int main(int argc, char* argv[]) {
 
                                 const PersonClick* best_clk = nullptr;
                                 for (auto it = it_s; it != it_e; ++it) {
-                                    asst_list.push_back(it->camp_idx);
+                                    if (asst_count < 256) {
+                                        asst_buf[asst_count++] = it->camp_idx;
+                                    } else {
+                                        asst_overflow.push_back(it->camp_idx);
+                                    }
                                     if (!best_clk) {
                                         best_clk = it;
                                     } else {
@@ -1217,12 +1350,24 @@ int main(int argc, char* argv[]) {
                             if (s_has_purchase) cd.purchasing++;
                             cd.revenue += s_revenue;
 
-                            if (!asst_list.empty()) {
-                                std::sort(asst_list.begin(), asst_list.end());
-                                for (size_t a = 0; a < asst_list.size(); ++a) {
-                                    if (a == 0 || asst_list[a] != asst_list[a - 1]) {
-                                        size_t asst_pos = static_cast<size_t>(asst_list[a]) * num_window_days + day_offset;
-                                        my_camp_stats[asst_pos].assisted++;
+                            if (asst_count > 0) {
+                                if (asst_overflow.empty()) {
+                                    std::sort(asst_buf, asst_buf + asst_count);
+                                    for (size_t a = 0; a < asst_count; ++a) {
+                                        if (a == 0 || asst_buf[a] != asst_buf[a - 1]) {
+                                            size_t asst_pos = static_cast<size_t>(asst_buf[a]) * num_window_days + day_offset;
+                                            my_camp_stats[asst_pos].assisted++;
+                                        }
+                                    }
+                                } else {
+                                    std::vector<uint16_t> all_asst(asst_buf, asst_buf + asst_count);
+                                    all_asst.insert(all_asst.end(), asst_overflow.begin(), asst_overflow.end());
+                                    std::sort(all_asst.begin(), all_asst.end());
+                                    for (size_t a = 0; a < all_asst.size(); ++a) {
+                                        if (a == 0 || all_asst[a] != all_asst[a - 1]) {
+                                            size_t asst_pos = static_cast<size_t>(all_asst[a]) * num_window_days + day_offset;
+                                            my_camp_stats[asst_pos].assisted++;
+                                        }
                                     }
                                 }
                             }
@@ -1359,6 +1504,8 @@ int main(int argc, char* argv[]) {
         out.write(reinterpret_cast<const char*>(b_c_bmp.data()), b_c_bmp.size());
         out.write(reinterpret_cast<const char*>(b_c_off.data()), b_c_off.size() * sizeof(int32_t));
         out.write(b_c_chars.data(), b_c_chars.size());
+        out.flush();
+        out.close();
     }
 
     // 2. Write _cd.bin
@@ -1429,6 +1576,8 @@ int main(int argc, char* argv[]) {
         out.write(b_cid_chars.data(), b_cid_chars.size());
         out.write(reinterpret_cast<const char*>(b_chn_off.data()), b_chn_off.size() * sizeof(int32_t));
         out.write(b_chn_chars.data(), b_chn_chars.size());
+        out.flush();
+        out.close();
     }
 
     // Write ready flag to notify write_parquet.py
@@ -1436,6 +1585,7 @@ int main(int argc, char* argv[]) {
         std::ofstream flag(scratch_dir + "/_ready.flag");
         flag.put('1');
         flag.flush();
+        flag.close();
     }
 
     return 0;

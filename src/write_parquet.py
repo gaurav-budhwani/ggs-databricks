@@ -5,6 +5,7 @@ the exact Parquet tables expected by the scorer with zero-copy.
 """
 import os
 import sys
+import time
 import struct
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -28,7 +29,8 @@ def write_user_daily(scratch_dir, out_dir):
                 pa.array([], type=pa.int64()),
                 pa.array([], type=pa.string()),
             ], names=["user_id", "day", "sessions", "events", "revenue_cents", "top_category"])
-            pq.write_table(ud_table, os.path.join(out_dir, "user_daily", "part-0.parquet"))
+            pq.write_table(ud_table, os.path.join(out_dir, "user_daily", "part-0.parquet"),
+                           use_dictionary=False, row_group_size=524288)
             return
 
         pos = 32
@@ -52,7 +54,8 @@ def write_user_daily(scratch_dir, out_dir):
 
         ud_table = pa.Table.from_arrays([arr_uid, arr_day, arr_sess, arr_evts, arr_rev, arr_cat],
                                      names=["user_id", "day", "sessions", "events", "revenue_cents", "top_category"])
-        pq.write_table(ud_table, os.path.join(out_dir, "user_daily", "part-0.parquet"))
+        pq.write_table(ud_table, os.path.join(out_dir, "user_daily", "part-0.parquet"),
+                       use_dictionary=False, row_group_size=524288)
     else:
         # Fallback for empty
         ud_table = pa.Table.from_arrays([
@@ -63,7 +66,8 @@ def write_user_daily(scratch_dir, out_dir):
             pa.array([], type=pa.int64()),
             pa.array([], type=pa.string()),
         ], names=["user_id", "day", "sessions", "events", "revenue_cents", "top_category"])
-        pq.write_table(ud_table, os.path.join(out_dir, "user_daily", "part-0.parquet"))
+        pq.write_table(ud_table, os.path.join(out_dir, "user_daily", "part-0.parquet"),
+                       use_dictionary=False, row_group_size=524288)
 
 def write_campaign_daily(scratch_dir, out_dir):
     cd_bin = os.path.join(scratch_dir, "_cd.bin")
@@ -84,7 +88,8 @@ def write_campaign_daily(scratch_dir, out_dir):
                 pa.array([], type=pa.int64()),
                 pa.array([], type=pa.int64()),
             ], names=["campaign_id", "channel", "day", "sessions", "purchasing_sessions", "revenue_cents", "assisted_sessions"])
-            pq.write_table(cd_table, os.path.join(out_dir, "campaign_daily", "part-0.parquet"))
+            pq.write_table(cd_table, os.path.join(out_dir, "campaign_daily", "part-0.parquet"),
+                           use_dictionary=False, row_group_size=524288)
             return
 
         pos = 32
@@ -108,7 +113,8 @@ def write_campaign_daily(scratch_dir, out_dir):
 
         cd_table = pa.Table.from_arrays([arr_cid, arr_chn, arr_day, arr_sess, arr_psess, arr_rev, arr_asst],
                                      names=["campaign_id", "channel", "day", "sessions", "purchasing_sessions", "revenue_cents", "assisted_sessions"])
-        pq.write_table(cd_table, os.path.join(out_dir, "campaign_daily", "part-0.parquet"))
+        pq.write_table(cd_table, os.path.join(out_dir, "campaign_daily", "part-0.parquet"),
+                       use_dictionary=False, row_group_size=524288)
     else:
         # Fallback for empty
         cd_table = pa.Table.from_arrays([
@@ -120,7 +126,8 @@ def write_campaign_daily(scratch_dir, out_dir):
             pa.array([], type=pa.int64()),
             pa.array([], type=pa.int64()),
         ], names=["campaign_id", "channel", "day", "sessions", "purchasing_sessions", "revenue_cents", "assisted_sessions"])
-        pq.write_table(cd_table, os.path.join(out_dir, "campaign_daily", "part-0.parquet"))
+        pq.write_table(cd_table, os.path.join(out_dir, "campaign_daily", "part-0.parquet"),
+                       use_dictionary=False, row_group_size=524288)
 
 def main():
     scratch_dir = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("SCRATCH_DIR", "/scratch")
@@ -128,6 +135,10 @@ def main():
 
     os.makedirs(os.path.join(out_dir, "user_daily"), exist_ok=True)
     os.makedirs(os.path.join(out_dir, "campaign_daily"), exist_ok=True)
+
+    ready_flag = os.path.join(scratch_dir, "_ready.flag")
+    while not os.path.exists(ready_flag):
+        time.sleep(0.0005)
 
     with ThreadPoolExecutor(max_workers=2) as ex:
         f1 = ex.submit(write_user_daily, scratch_dir, out_dir)
