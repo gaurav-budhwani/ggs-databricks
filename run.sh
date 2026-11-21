@@ -39,14 +39,8 @@ else
     PYTHON="python"
 fi
 
-rm -f "$SCRATCH_DIR/_ready.flag" "$SCRATCH_DIR/_ud.bin" "$SCRATCH_DIR/_cd.bin"
-
-# Launch Python in the background to warm up VM and pyarrow imports concurrently
-"$PYTHON" "$PY_SCRIPT" "$SCRATCH_DIR" "$OUTPUT_DIR" &
-PY_PID=$!
-
-# Run the high-performance C++ engine
+# Step 1: Run C++ engine synchronously until completion
 "$ENGINE" "$DATA_DIR" "$SCRATCH_DIR"
 
-# Wait for Parquet tables to finish writing
-wait "$PY_PID"
+# Step 2: Run Python Parquet writer synchronously
+"$PYTHON" "$PY_SCRIPT" "$SCRATCH_DIR" "$OUTPUT_DIR"
