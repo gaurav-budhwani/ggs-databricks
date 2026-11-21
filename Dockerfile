@@ -1,4 +1,4 @@
-# Shopping Sessions: High-Performance Engine
+# Shopping Sessions: Ultra-High-Performance C++20 Direct Parquet Engine
 # Target platform: linux/amd64 (Intel Xeon Cascade Lake or newer)
 
 FROM python:3.12-slim-bookworm
@@ -15,8 +15,14 @@ WORKDIR /app
 COPY src/ /app/src/
 COPY run.sh /app/run.sh
 
-# Compile C++ engine with native optimization
-RUN g++ -O3 -std=c++20 -march=x86-64-v3 -DNDEBUG -pthread \
+# Compile C++ engine with PyArrow Arrow/Parquet C++ libraries and native x86-64-v3 optimization
+RUN PYARROW_INC=$(python3 -c "import pyarrow; print(pyarrow.get_include())") && \
+    PYARROW_LIB=$(python3 -c "import pyarrow; print(pyarrow.get_library_dirs()[0])") && \
+    g++ -O3 -std=c++20 -march=x86-64-v3 -DNDEBUG -pthread \
+    -I"${PYARROW_INC}" \
+    -L"${PYARROW_LIB}" \
+    -larrow -lparquet \
+    -Wl,-rpath,"${PYARROW_LIB}" \
     /app/src/engine.cpp \
     -o /app/engine \
     && apt-get purge -y build-essential \

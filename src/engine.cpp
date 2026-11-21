@@ -15,6 +15,10 @@
 #include <atomic>
 #include <chrono>
 
+#include <arrow/api.h>
+#include <arrow/io/file.h>
+#include <parquet/arrow/writer.h>
+
 namespace fs = std::filesystem;
 
 static const int DAYS_IN_MONTH[] = {0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
@@ -231,6 +235,7 @@ struct FlatDSU {
     std::vector<std::string> id_to_user;
     std::vector<uint32_t> parent;
     std::vector<uint32_t> min_id;
+    std::vector<uint32_t> canonical_min_id;
 
     void init(size_t cap) {
         size_t n = 1;
@@ -239,7 +244,27 @@ struct FlatDSU {
         mask = n - 1;
     }
 
+    void grow() {
+        size_t new_cap = table.empty() ? 65536 : table.size() * 2;
+        std::vector<Entry> new_table(new_cap, Entry{0, 0});
+        size_t new_mask = new_cap - 1;
+        for (const auto& entry : table) {
+            if (entry.hash != 0) {
+                size_t idx = entry.hash & new_mask;
+                while (new_table[idx].hash != 0) {
+                    idx = (idx + 1) & new_mask;
+                }
+                new_table[idx] = entry;
+            }
+        }
+        table = std::move(new_table);
+        mask = new_mask;
+    }
+
     uint32_t get_or_create(std::string_view u) {
+        if (table.empty() || id_to_user.size() * 2 >= table.size()) {
+            grow();
+        }
         uint64_t h = hash_str(u);
         if (h == 0) h = 1;
         size_t idx = h & mask;
@@ -282,15 +307,21 @@ struct FlatDSU {
         }
     }
 
-    std::string_view get_canonical(std::string_view u) noexcept {
+    void finalize() {
+        canonical_min_id.resize(id_to_user.size());
+        for (size_t i = 0; i < id_to_user.size(); ++i) {
+            canonical_min_id[i] = min_id[find(static_cast<uint32_t>(i))];
+        }
+    }
+
+    std::string_view get_canonical(std::string_view u) const noexcept {
         if (mask == 0) return u;
         uint64_t h = hash_str(u);
         if (h == 0) h = 1;
         size_t idx = h & mask;
         while (table[idx].hash != 0) {
             if (table[idx].hash == h && id_to_user[table[idx].id] == u) {
-                uint32_t root = find(table[idx].id);
-                return id_to_user[min_id[root]];
+                return id_to_user[canonical_min_id[table[idx].id]];
             }
             idx = (idx + 1) & mask;
         }
@@ -306,15 +337,37 @@ struct FlatProdMap {
     };
     std::vector<Entry> table;
     size_t mask = 0;
+    size_t count = 0;
 
     void init(size_t cap) {
         size_t n = 1;
         while (n < cap * 2) n <<= 1;
         table.assign(n, Entry{});
         mask = n - 1;
+        count = 0;
+    }
+
+    void grow() {
+        size_t new_cap = table.empty() ? 65536 : table.size() * 2;
+        std::vector<Entry> new_table(new_cap, Entry{});
+        size_t new_mask = new_cap - 1;
+        for (const auto& entry : table) {
+            if (entry.hash != 0) {
+                size_t idx = entry.hash & new_mask;
+                while (new_table[idx].hash != 0) {
+                    idx = (idx + 1) & new_mask;
+                }
+                new_table[idx] = entry;
+            }
+        }
+        table = std::move(new_table);
+        mask = new_mask;
     }
 
     void insert(std::string_view prod, uint16_t cidx) {
+        if (table.empty() || count * 2 >= table.size()) {
+            grow();
+        }
         uint64_t h = hash_str(prod);
         if (h == 0) h = 1;
         size_t idx = h & mask;
@@ -326,6 +379,7 @@ struct FlatProdMap {
             idx = (idx + 1) & mask;
         }
         table[idx] = {h, prod, cidx};
+        count++;
     }
 
     uint16_t find(std::string_view prod) const noexcept {
@@ -351,15 +405,37 @@ struct FlatCampMap {
     };
     std::vector<Entry> table;
     size_t mask = 0;
+    size_t count = 0;
 
     void init(size_t cap) {
         size_t n = 1;
         while (n < cap * 2) n <<= 1;
         table.assign(n, Entry{});
         mask = n - 1;
+        count = 0;
+    }
+
+    void grow() {
+        size_t new_cap = table.empty() ? 4096 : table.size() * 2;
+        std::vector<Entry> new_table(new_cap, Entry{});
+        size_t new_mask = new_cap - 1;
+        for (const auto& entry : table) {
+            if (entry.hash != 0) {
+                size_t idx = entry.hash & new_mask;
+                while (new_table[idx].hash != 0) {
+                    idx = (idx + 1) & new_mask;
+                }
+                new_table[idx] = entry;
+            }
+        }
+        table = std::move(new_table);
+        mask = new_mask;
     }
 
     void insert(std::string_view camp, uint16_t idx_val) {
+        if (table.empty() || count * 2 >= table.size()) {
+            grow();
+        }
         uint64_t h = hash_str(camp);
         if (h == 0) h = 1;
         size_t idx = h & mask;
@@ -371,6 +447,7 @@ struct FlatCampMap {
             idx = (idx + 1) & mask;
         }
         table[idx] = {h, camp, idx_val};
+        count++;
     }
 
     uint16_t find(std::string_view camp) const noexcept {
@@ -436,14 +513,188 @@ struct UserDailyRow {
     std::string_view top_category;
 };
 
+struct ShardCdStats {
+    int64_t sessions = 0;
+    int64_t purchasing = 0;
+    int64_t revenue = 0;
+    int64_t assisted = 0;
+};
+
+// Write Parquet directly using Apache Arrow C++
+void write_user_daily_parquet(
+    const std::string& out_dir,
+    const std::vector<std::vector<UserDailyRow>>& shard_rows,
+    size_t num_shards
+) {
+    fs::create_directories(out_dir + "/user_daily");
+
+    size_t total_rows = 0;
+    size_t u_chars_len = 0;
+    size_t cat_chars_len = 0;
+    for (size_t s = 0; s < num_shards; ++s) {
+        total_rows += shard_rows[s].size();
+        for (const auto& r : shard_rows[s]) {
+            u_chars_len += r.user_id.size();
+            if (!r.top_category.empty()) {
+                cat_chars_len += r.top_category.size();
+            }
+        }
+    }
+
+    arrow::StringBuilder uid_b;
+    arrow::Date32Builder day_b;
+    arrow::Int64Builder sess_b, evts_b, rev_b;
+    arrow::StringBuilder cat_b;
+
+    (void)uid_b.Reserve(static_cast<int64_t>(total_rows));
+    (void)uid_b.ReserveData(static_cast<int64_t>(u_chars_len));
+    (void)day_b.Reserve(static_cast<int64_t>(total_rows));
+    (void)sess_b.Reserve(static_cast<int64_t>(total_rows));
+    (void)evts_b.Reserve(static_cast<int64_t>(total_rows));
+    (void)rev_b.Reserve(static_cast<int64_t>(total_rows));
+    (void)cat_b.Reserve(static_cast<int64_t>(total_rows));
+    (void)cat_b.ReserveData(static_cast<int64_t>(cat_chars_len));
+
+    for (size_t s = 0; s < num_shards; ++s) {
+        for (const auto& r : shard_rows[s]) {
+            (void)uid_b.Append(r.user_id.data(), static_cast<int32_t>(r.user_id.size()));
+            (void)day_b.Append(r.day);
+            (void)sess_b.Append(r.sessions);
+            (void)evts_b.Append(r.events);
+            (void)rev_b.Append(r.revenue_cents);
+            if (!r.top_category.empty()) {
+                (void)cat_b.Append(r.top_category.data(), static_cast<int32_t>(r.top_category.size()));
+            } else {
+                (void)cat_b.AppendNull();
+            }
+        }
+    }
+
+    std::shared_ptr<arrow::Array> u_arr, d_arr, s_arr, e_arr, r_arr, c_arr;
+    (void)uid_b.Finish(&u_arr);
+    (void)day_b.Finish(&d_arr);
+    (void)sess_b.Finish(&s_arr);
+    (void)evts_b.Finish(&e_arr);
+    (void)rev_b.Finish(&r_arr);
+    (void)cat_b.Finish(&c_arr);
+
+    auto schema = arrow::schema({
+        arrow::field("user_id", arrow::utf8()),
+        arrow::field("day", arrow::date32()),
+        arrow::field("sessions", arrow::int64()),
+        arrow::field("events", arrow::int64()),
+        arrow::field("revenue_cents", arrow::int64()),
+        arrow::field("top_category", arrow::utf8())
+    });
+
+    auto table = arrow::Table::Make(schema, {u_arr, d_arr, s_arr, e_arr, r_arr, c_arr});
+
+    std::shared_ptr<arrow::io::FileOutputStream> outfile;
+    PARQUET_ASSIGN_OR_THROW(outfile, arrow::io::FileOutputStream::Open(out_dir + "/user_daily/part-0.parquet"));
+    parquet::WriterProperties::Builder prop_b;
+    prop_b.compression(arrow::Compression::SNAPPY);
+    auto props = prop_b.build();
+    PARQUET_THROW_NOT_OK(parquet::arrow::WriteTable(*table, arrow::default_memory_pool(), outfile, 65536, props));
+}
+
+void write_campaign_daily_parquet(
+    const std::string& out_dir,
+    const std::vector<ShardCdStats>& merged_camp_day,
+    const std::vector<std::pair<std::string_view, std::string_view>>& camp_list,
+    int32_t win_start_day,
+    int num_window_days
+) {
+    fs::create_directories(out_dir + "/campaign_daily");
+
+    size_t total_rows = 0;
+    size_t cid_chars_len = 0;
+    size_t chn_chars_len = 0;
+
+    for (size_t c = 0; c < camp_list.size(); ++c) {
+        for (int d = 0; d < num_window_days; ++d) {
+            const auto& cd = merged_camp_day[c * num_window_days + d];
+            if (cd.sessions > 0 || cd.assisted > 0) {
+                total_rows++;
+                cid_chars_len += camp_list[c].first.size();
+                chn_chars_len += camp_list[c].second.size();
+            }
+        }
+    }
+
+    arrow::StringBuilder cid_b;
+    arrow::StringBuilder chn_b;
+    arrow::Date32Builder day_b;
+    arrow::Int64Builder sess_b, psess_b, rev_b, asst_b;
+
+    (void)cid_b.Reserve(static_cast<int64_t>(total_rows));
+    (void)cid_b.ReserveData(static_cast<int64_t>(cid_chars_len));
+    (void)chn_b.Reserve(static_cast<int64_t>(total_rows));
+    (void)chn_b.ReserveData(static_cast<int64_t>(chn_chars_len));
+    (void)day_b.Reserve(static_cast<int64_t>(total_rows));
+    (void)sess_b.Reserve(static_cast<int64_t>(total_rows));
+    (void)psess_b.Reserve(static_cast<int64_t>(total_rows));
+    (void)rev_b.Reserve(static_cast<int64_t>(total_rows));
+    (void)asst_b.Reserve(static_cast<int64_t>(total_rows));
+
+    for (size_t c = 0; c < camp_list.size(); ++c) {
+        for (int d = 0; d < num_window_days; ++d) {
+            const auto& cd = merged_camp_day[c * num_window_days + d];
+            if (cd.sessions > 0 || cd.assisted > 0) {
+                (void)cid_b.Append(camp_list[c].first.data(), static_cast<int32_t>(camp_list[c].first.size()));
+                (void)chn_b.Append(camp_list[c].second.data(), static_cast<int32_t>(camp_list[c].second.size()));
+                (void)day_b.Append(win_start_day + d);
+                (void)sess_b.Append(cd.sessions);
+                (void)psess_b.Append(cd.purchasing);
+                (void)rev_b.Append(cd.revenue);
+                (void)asst_b.Append(cd.assisted);
+            }
+        }
+    }
+
+    std::shared_ptr<arrow::Array> cid_arr, chn_arr, d_arr, s_arr, ps_arr, r_arr, a_arr;
+    (void)cid_b.Finish(&cid_arr);
+    (void)chn_b.Finish(&chn_arr);
+    (void)day_b.Finish(&d_arr);
+    (void)sess_b.Finish(&s_arr);
+    (void)psess_b.Finish(&ps_arr);
+    (void)rev_b.Finish(&r_arr);
+    (void)asst_b.Finish(&a_arr);
+
+    auto schema = arrow::schema({
+        arrow::field("campaign_id", arrow::utf8()),
+        arrow::field("channel", arrow::utf8()),
+        arrow::field("day", arrow::date32()),
+        arrow::field("sessions", arrow::int64()),
+        arrow::field("purchasing_sessions", arrow::int64()),
+        arrow::field("revenue_cents", arrow::int64()),
+        arrow::field("assisted_sessions", arrow::int64())
+    });
+
+    auto table = arrow::Table::Make(schema, {cid_arr, chn_arr, d_arr, s_arr, ps_arr, r_arr, a_arr});
+
+    std::shared_ptr<arrow::io::FileOutputStream> outfile;
+    PARQUET_ASSIGN_OR_THROW(outfile, arrow::io::FileOutputStream::Open(out_dir + "/campaign_daily/part-0.parquet"));
+    parquet::WriterProperties::Builder prop_b;
+    prop_b.compression(arrow::Compression::SNAPPY);
+    auto props = prop_b.build();
+    PARQUET_THROW_NOT_OK(parquet::arrow::WriteTable(*table, arrow::default_memory_pool(), outfile, 65536, props));
+}
+
 int main(int argc, char* argv[]) {
     std::ios_base::sync_with_stdio(false);
     std::cin.tie(NULL);
 
     std::string data_dir = "/data";
+    std::string output_dir = "/output";
     std::string scratch_dir = "/scratch";
+
+    if (const char* env_d = getenv("DATA_DIR")) data_dir = env_d;
+    if (const char* env_o = getenv("OUTPUT_DIR")) output_dir = env_o;
+    if (const char* env_s = getenv("SCRATCH_DIR")) scratch_dir = env_s;
+
     if (argc > 1) data_dir = argv[1];
-    if (argc > 2) scratch_dir = argv[2];
+    if (argc > 2) output_dir = argv[2];
+    if (argc > 3) scratch_dir = argv[3];
 
     size_t num_threads = std::thread::hardware_concurrency();
     if (const char* env_ncpu = getenv("NCPU")) {
@@ -461,17 +712,20 @@ int main(int argc, char* argv[]) {
         std::ifstream mf(data_dir + "/manifest.json");
         std::string content((std::istreambuf_iterator<char>(mf)), std::istreambuf_iterator<char>());
         size_t s1 = content.find("\"window_start\"");
-        size_t s2 = content.find("\"", s1 + 14);
-        size_t s3 = content.find("\"", s2 + 1);
-        std::string ws = content.substr(s2 + 1, s3 - s2 - 1);
+        if (s1 != std::string::npos) {
+            size_t s2 = content.find("\"", s1 + 14);
+            size_t s3 = content.find("\"", s2 + 1);
+            std::string ws = content.substr(s2 + 1, s3 - s2 - 1);
+            parse_iso_f1(ws, win_start_ms);
+        }
 
         size_t e1 = content.find("\"window_end\"");
-        size_t e2 = content.find("\"", e1 + 12);
-        size_t e3 = content.find("\"", e2 + 1);
-        std::string we = content.substr(e2 + 1, e3 - e2 - 1);
-
-        parse_iso_f1(ws, win_start_ms);
-        parse_iso_f1(we, win_end_ms);
+        if (e1 != std::string::npos) {
+            size_t e2 = content.find("\"", e1 + 12);
+            size_t e3 = content.find("\"", e2 + 1);
+            std::string we = content.substr(e2 + 1, e3 - e2 - 1);
+            parse_iso_f1(we, win_end_ms);
+        }
     }
     int64_t click_win_start_ms = win_start_ms - 7LL * 86400 * 1000;
     int32_t win_start_day = static_cast<int32_t>(win_start_ms / 86400000);
@@ -501,12 +755,12 @@ int main(int argc, char* argv[]) {
                     uint16_t cidx = 0;
                     for (size_t c = 0; c < cat_names.size(); ++c) {
                         if (cat_names[c] == fields[1]) {
-                            cidx = c;
+                            cidx = static_cast<uint16_t>(c);
                             break;
                         }
                     }
                     if (cidx == 0 && fields[1] != "unknown") {
-                        cidx = cat_names.size();
+                        cidx = static_cast<uint16_t>(cat_names.size());
                         cat_names.emplace_back(fields[1]);
                     }
                     prod_to_cat.insert(fields[0], cidx);
@@ -535,7 +789,7 @@ int main(int argc, char* argv[]) {
 
             if (parse_csv_line(line, 2, fields)) {
                 if (!fields[0].empty()) {
-                    uint16_t idx = camp_list.size();
+                    uint16_t idx = static_cast<uint16_t>(camp_list.size());
                     camp_to_idx.insert(fields[0], idx);
                     camp_list.emplace_back(fields[0], fields[1]);
                 }
@@ -582,6 +836,7 @@ int main(int argc, char* argv[]) {
             }
         }
     }
+    dsu.finalize();
 
     // 5. Memory map all events/*.csv files
     std::vector<std::pair<size_t, std::string>> ev_files_with_size;
@@ -959,13 +1214,6 @@ int main(int argc, char* argv[]) {
     thread_click_shards.clear();
 
     // 9. Sessionize and Aggregate per person shard
-    struct ShardCdStats {
-        int64_t sessions = 0;
-        int64_t purchasing = 0;
-        int64_t revenue = 0;
-        int64_t assisted = 0;
-    };
-
     std::vector<std::vector<UserDailyRow>> shard_user_daily_rows(NUM_SHARDS);
     std::vector<std::vector<ShardCdStats>> shard_camp_stats(
         NUM_SHARDS, std::vector<ShardCdStats>(camp_list.size() * num_window_days)
@@ -973,6 +1221,7 @@ int main(int argc, char* argv[]) {
 
     const int64_t SEVEN_DAYS = 7LL * 86400 * 1000;
     const int64_t THIRTY_MINS = 1800000;
+    const size_t num_cats = cat_names.size();
 
     {
         std::vector<std::thread> workers;
@@ -982,15 +1231,15 @@ int main(int argc, char* argv[]) {
             workers.emplace_back([&pshard_idx, &thread_person_events, &thread_person_clicks,
                                   &shard_user_daily_rows, &shard_camp_stats,
                                   &cat_names, &camp_list, num_threads, SEVEN_DAYS, THIRTY_MINS,
-                                  win_start_day, num_window_days]() {
+                                  win_start_day, num_window_days, num_cats]() {
                 struct UdStats {
                     int64_t sessions = 0;
                     int64_t events = 0;
                     int64_t revenue = 0;
-                    int64_t cat_rev[32] = {0};
                 };
 
                 std::vector<UdStats> user_days(num_window_days);
+                std::vector<int64_t> user_cat_rev(num_window_days * num_cats, 0);
                 std::vector<int> visited_days;
                 visited_days.reserve(32);
 
@@ -1083,12 +1332,15 @@ int main(int argc, char* argv[]) {
                             ud.sessions++;
                             ud.events += (s_finish - s_begin);
 
+                            size_t cat_base = static_cast<size_t>(day_offset) * num_cats;
                             for (size_t i = s_begin; i < s_finish; ++i) {
                                 const auto& ev = ps_events[i];
                                 if (ev.type == 2) {
                                     s_revenue += ev.price_cents;
                                     s_has_purchase = true;
-                                    if (ev.cat_idx < 32) ud.cat_rev[ev.cat_idx] += ev.price_cents;
+                                    if (ev.cat_idx < num_cats) {
+                                        user_cat_rev[cat_base + ev.cat_idx] += ev.price_cents;
+                                    }
                                 }
                             }
                             ud.revenue += s_revenue;
@@ -1161,8 +1413,9 @@ int main(int argc, char* argv[]) {
                             auto& stats = user_days[d_off];
                             std::string_view top_cat = "";
                             int64_t max_rev = -1;
-                            for (size_t c = 0; c < cat_names.size() && c < 32; ++c) {
-                                int64_t r = stats.cat_rev[c];
+                            size_t cat_base = static_cast<size_t>(d_off) * num_cats;
+                            for (size_t c = 0; c < num_cats; ++c) {
+                                int64_t r = user_cat_rev[cat_base + c];
                                 if (r > 0) {
                                     if (r > max_rev) {
                                         max_rev = r;
@@ -1172,6 +1425,7 @@ int main(int argc, char* argv[]) {
                                             top_cat = cat_names[c];
                                         }
                                     }
+                                    user_cat_rev[cat_base + c] = 0; // reset
                                 }
                             }
                             shard_user_daily_rows[ps].push_back(UserDailyRow{
@@ -1201,174 +1455,15 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    // Write binary buffers and TSV files
-    fs::create_directories(scratch_dir);
-
-    // 1. Write _ud.bin
-    {
-        size_t total_ud = 0;
-        size_t u_chars_len = 0;
-        size_t cat_chars_len = 0;
-        for (size_t s = 0; s < NUM_SHARDS; ++s) {
-            total_ud += shard_user_daily_rows[s].size();
-            for (const auto& r : shard_user_daily_rows[s]) {
-                u_chars_len += r.user_id.size();
-                if (!r.top_category.empty()) {
-                    cat_chars_len += r.top_category.size();
-                }
-            }
-        }
-
-        std::vector<int32_t> b_days; b_days.reserve(total_ud);
-        std::vector<int64_t> b_sess; b_sess.reserve(total_ud);
-        std::vector<int64_t> b_evts; b_evts.reserve(total_ud);
-        std::vector<int64_t> b_rev; b_rev.reserve(total_ud);
-        std::vector<int32_t> b_u_off; b_u_off.reserve(total_ud + 1);
-        std::string b_u_chars; b_u_chars.reserve(u_chars_len);
-
-        size_t c_bmp_len = (total_ud + 7) / 8;
-        std::vector<uint8_t> b_c_bmp(c_bmp_len, 0);
-        std::vector<int32_t> b_c_off; b_c_off.reserve(total_ud + 1);
-        std::string b_c_chars; b_c_chars.reserve(cat_chars_len);
-
-        b_u_off.push_back(0);
-        b_c_off.push_back(0);
-
-        size_t row_idx = 0;
-        for (size_t s = 0; s < NUM_SHARDS; ++s) {
-            for (const auto& r : shard_user_daily_rows[s]) {
-                b_days.push_back(r.day);
-                b_sess.push_back(r.sessions);
-                b_evts.push_back(r.events);
-                b_rev.push_back(r.revenue_cents);
-
-                b_u_chars.append(r.user_id);
-                b_u_off.push_back(static_cast<int32_t>(b_u_chars.size()));
-
-                if (!r.top_category.empty()) {
-                    b_c_bmp[row_idx / 8] |= (1 << (row_idx % 8));
-                    b_c_chars.append(r.top_category);
-                }
-                b_c_off.push_back(static_cast<int32_t>(b_c_chars.size()));
-                row_idx++;
-            }
-        }
-
-        uint64_t header[4] = {
-            static_cast<uint64_t>(total_ud),
-            static_cast<uint64_t>(b_u_chars.size()),
-            static_cast<uint64_t>(b_c_chars.size()),
-            0
-        };
-
-        std::ofstream out(scratch_dir + "/_ud.bin", std::ios::binary);
-        out.write(reinterpret_cast<const char*>(header), sizeof(header));
-        out.write(reinterpret_cast<const char*>(b_days.data()), b_days.size() * sizeof(int32_t));
-        out.write(reinterpret_cast<const char*>(b_sess.data()), b_sess.size() * sizeof(int64_t));
-        out.write(reinterpret_cast<const char*>(b_evts.data()), b_evts.size() * sizeof(int64_t));
-        out.write(reinterpret_cast<const char*>(b_rev.data()), b_rev.size() * sizeof(int64_t));
-        out.write(reinterpret_cast<const char*>(b_u_off.data()), b_u_off.size() * sizeof(int32_t));
-        out.write(b_u_chars.data(), b_u_chars.size());
-        out.write(reinterpret_cast<const char*>(b_c_bmp.data()), b_c_bmp.size());
-        out.write(reinterpret_cast<const char*>(b_c_off.data()), b_c_off.size() * sizeof(int32_t));
-        out.write(b_c_chars.data(), b_c_chars.size());
-    }
-
-    // 2. Write _cd.bin
-    {
-        size_t total_cd = 0;
-        size_t cid_chars_len = 0;
-        size_t chn_chars_len = 0;
-        for (size_t c = 0; c < camp_list.size(); ++c) {
-            for (int d = 0; d < num_window_days; ++d) {
-                const auto& cd = merged_camp_day[c * num_window_days + d];
-                if (cd.sessions > 0 || cd.assisted > 0) {
-                    total_cd++;
-                    cid_chars_len += camp_list[c].first.size();
-                    chn_chars_len += camp_list[c].second.size();
-                }
-            }
-        }
-
-        std::vector<int32_t> b_days; b_days.reserve(total_cd);
-        std::vector<int64_t> b_sess; b_sess.reserve(total_cd);
-        std::vector<int64_t> b_psess; b_psess.reserve(total_cd);
-        std::vector<int64_t> b_rev; b_rev.reserve(total_cd);
-        std::vector<int64_t> b_asst; b_asst.reserve(total_cd);
-
-        std::vector<int32_t> b_cid_off; b_cid_off.reserve(total_cd + 1);
-        std::string b_cid_chars; b_cid_chars.reserve(cid_chars_len);
-
-        std::vector<int32_t> b_chn_off; b_chn_off.reserve(total_cd + 1);
-        std::string b_chn_chars; b_chn_chars.reserve(chn_chars_len);
-
-        b_cid_off.push_back(0);
-        b_chn_off.push_back(0);
-
-        for (size_t c = 0; c < camp_list.size(); ++c) {
-            for (int d = 0; d < num_window_days; ++d) {
-                const auto& cd = merged_camp_day[c * num_window_days + d];
-                if (cd.sessions > 0 || cd.assisted > 0) {
-                    b_days.push_back(win_start_day + d);
-                    b_sess.push_back(cd.sessions);
-                    b_psess.push_back(cd.purchasing);
-                    b_rev.push_back(cd.revenue);
-                    b_asst.push_back(cd.assisted);
-
-                    b_cid_chars.append(camp_list[c].first);
-                    b_cid_off.push_back(static_cast<int32_t>(b_cid_chars.size()));
-
-                    b_chn_chars.append(camp_list[c].second);
-                    b_chn_off.push_back(static_cast<int32_t>(b_chn_chars.size()));
-                }
-            }
-        }
-
-        uint64_t header[4] = {
-            static_cast<uint64_t>(total_cd),
-            static_cast<uint64_t>(b_cid_chars.size()),
-            static_cast<uint64_t>(b_chn_chars.size()),
-            0
-        };
-
-        std::ofstream out(scratch_dir + "/_cd.bin", std::ios::binary);
-        out.write(reinterpret_cast<const char*>(header), sizeof(header));
-        out.write(reinterpret_cast<const char*>(b_days.data()), b_days.size() * sizeof(int32_t));
-        out.write(reinterpret_cast<const char*>(b_sess.data()), b_sess.size() * sizeof(int64_t));
-        out.write(reinterpret_cast<const char*>(b_psess.data()), b_psess.size() * sizeof(int64_t));
-        out.write(reinterpret_cast<const char*>(b_rev.data()), b_rev.size() * sizeof(int64_t));
-        out.write(reinterpret_cast<const char*>(b_asst.data()), b_asst.size() * sizeof(int64_t));
-        out.write(reinterpret_cast<const char*>(b_cid_off.data()), b_cid_off.size() * sizeof(int32_t));
-        out.write(b_cid_chars.data(), b_cid_chars.size());
-        out.write(reinterpret_cast<const char*>(b_chn_off.data()), b_chn_off.size() * sizeof(int32_t));
-        out.write(b_chn_chars.data(), b_chn_chars.size());
-    }
-
-    // Write TSV files as well
-    {
-        std::ofstream out_ud(scratch_dir + "/_ud.tsv");
-        for (size_t s = 0; s < NUM_SHARDS; ++s) {
-            for (const auto& r : shard_user_daily_rows[s]) {
-                out_ud << r.user_id << '\t' << r.day << '\t' << r.sessions << '\t'
-                       << r.events << '\t' << r.revenue_cents << '\t' << r.top_category << '\n';
-            }
-        }
-    }
-
-    {
-        std::ofstream out_cd(scratch_dir + "/_cd.tsv");
-        for (size_t c = 0; c < camp_list.size(); ++c) {
-            for (int d = 0; d < num_window_days; ++d) {
-                const auto& cd = merged_camp_day[c * num_window_days + d];
-                if (cd.sessions > 0 || cd.assisted > 0) {
-                    out_cd << camp_list[c].first << '\t' << camp_list[c].second << '\t'
-                           << (win_start_day + d) << '\t'
-                           << cd.sessions << '\t' << cd.purchasing << '\t'
-                           << cd.revenue << '\t' << cd.assisted << '\n';
-                }
-            }
-        }
-    }
+    // Direct Parquet output in parallel
+    std::thread t_ud([&]() {
+        write_user_daily_parquet(output_dir, shard_user_daily_rows, NUM_SHARDS);
+    });
+    std::thread t_cd([&]() {
+        write_campaign_daily_parquet(output_dir, merged_camp_day, camp_list, win_start_day, num_window_days);
+    });
+    t_ud.join();
+    t_cd.join();
 
     return 0;
 }
