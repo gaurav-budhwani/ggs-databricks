@@ -5,17 +5,13 @@ the exact Parquet tables expected by the scorer with zero-copy.
 """
 import os
 import sys
+import time
 import struct
 import pyarrow as pa
 import pyarrow.parquet as pq
+from concurrent.futures import ThreadPoolExecutor
 
-def main():
-    scratch_dir = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("SCRATCH_DIR", "/scratch")
-    out_dir = sys.argv[2] if len(sys.argv) > 2 else os.environ.get("OUTPUT_DIR", "/output")
-
-    os.makedirs(os.path.join(out_dir, "user_daily"), exist_ok=True)
-    os.makedirs(os.path.join(out_dir, "campaign_daily"), exist_ok=True)
-
+def write_user_daily(scratch_dir, out_dir):
     ud_bin = os.path.join(scratch_dir, "_ud.bin")
     if os.path.isfile(ud_bin):
         with open(ud_bin, "rb") as f:
@@ -23,8 +19,20 @@ def main():
 
         hdr = struct.unpack_from("4Q", buf, 0)
         nr, u_len, c_len, _ = hdr
-        pos = 32
 
+        if nr == 0:
+            ud_table = pa.Table.from_arrays([
+                pa.array([], type=pa.string()),
+                pa.array([], type=pa.date32()),
+                pa.array([], type=pa.int64()),
+                pa.array([], type=pa.int64()),
+                pa.array([], type=pa.int64()),
+                pa.array([], type=pa.string()),
+            ], names=["user_id", "day", "sessions", "events", "revenue_cents", "top_category"])
+            pq.write_table(ud_table, os.path.join(out_dir, "user_daily", "part-0.parquet"))
+            return
+
+        pos = 32
         day_bytes = buf[pos : pos + nr * 4]; pos += nr * 4
         sess_bytes = buf[pos : pos + nr * 8]; pos += nr * 8
         evts_bytes = buf[pos : pos + nr * 8]; pos += nr * 8
@@ -79,6 +87,7 @@ def main():
         ], schema=ud_schema)
         pq.write_table(ud_table, os.path.join(out_dir, "user_daily", "part-0.parquet"))
 
+def write_campaign_daily(scratch_dir, out_dir):
     cd_bin = os.path.join(scratch_dir, "_cd.bin")
     if os.path.isfile(cd_bin):
         with open(cd_bin, "rb") as f:
@@ -86,8 +95,21 @@ def main():
 
         hdr = struct.unpack_from("4Q", buf, 0)
         nr, cid_len, chn_len, _ = hdr
-        pos = 32
 
+        if nr == 0:
+            cd_table = pa.Table.from_arrays([
+                pa.array([], type=pa.string()),
+                pa.array([], type=pa.string()),
+                pa.array([], type=pa.date32()),
+                pa.array([], type=pa.int64()),
+                pa.array([], type=pa.int64()),
+                pa.array([], type=pa.int64()),
+                pa.array([], type=pa.int64()),
+            ], names=["campaign_id", "channel", "day", "sessions", "purchasing_sessions", "revenue_cents", "assisted_sessions"])
+            pq.write_table(cd_table, os.path.join(out_dir, "campaign_daily", "part-0.parquet"))
+            return
+
+        pos = 32
         day_bytes = buf[pos : pos + nr * 4]; pos += nr * 4
         sess_bytes = buf[pos : pos + nr * 8]; pos += nr * 8
         psess_bytes = buf[pos : pos + nr * 8]; pos += nr * 8
@@ -144,6 +166,26 @@ def main():
             pa.array(c_asst, type=pa.int64()),
         ], schema=cd_schema)
         pq.write_table(cd_table, os.path.join(out_dir, "campaign_daily", "part-0.parquet"))
+
+def main():
+    scratch_dir = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("SCRATCH_DIR", "/scratch")
+    out_dir = sys.argv[2] if len(sys.argv) > 2 else os.environ.get("OUTPUT_DIR", "/output")
+
+    os.makedirs(os.path.join(out_dir, "user_daily"), exist_ok=True)
+    os.makedirs(os.path.join(out_dir, "campaign_daily"), exist_ok=True)
+
+    # If launched in background, wait for engine to finish writing binary buffers
+    ready_flag = os.path.join(scratch_dir, "_ready.flag")
+    # In case engine is still running:
+    while not os.path.isfile(ready_flag) and not os.path.isfile(os.path.join(scratch_dir, "_ud.bin")):
+        time.sleep(0.001)
+
+    # Write both Parquet tables concurrently
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        f1 = ex.submit(write_user_daily, scratch_dir, out_dir)
+        f2 = ex.submit(write_campaign_daily, scratch_dir, out_dir)
+        f1.result()
+        f2.result()
 
 if __name__ == "__main__":
     main()
