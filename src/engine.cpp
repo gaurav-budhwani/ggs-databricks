@@ -3,8 +3,6 @@
 #include <string>
 #include <string_view>
 #include <vector>
-#include <unordered_map>
-#include <unordered_set>
 #include <algorithm>
 #include <filesystem>
 #include <cstring>
@@ -15,12 +13,13 @@
 #include <sys/stat.h>
 #include <thread>
 #include <atomic>
+#include <chrono>
 
 namespace fs = std::filesystem;
 
 static const int DAYS_IN_MONTH[] = {0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
 
-static inline bool is_leap_year(int y) {
+static inline bool is_leap_year(int y) noexcept {
     return (y % 4 == 0 && y % 100 != 0) || (y % 400 == 0);
 }
 
@@ -33,7 +32,7 @@ static inline int64_t days_from_civil(int y, unsigned m, unsigned d) noexcept {
     return era * 146097 + static_cast<int64_t>(doe) - 719468;
 }
 
-static inline bool parse_iso_f1(std::string_view s, int64_t& out_ms) {
+static inline bool parse_iso_f1(std::string_view s, int64_t& out_ms) noexcept {
     if (s.size() != 20 || s[10] != 'T' || s[19] != 'Z') return false;
     if (s[4] != '-' || s[7] != '-' || s[13] != ':' || s[16] != ':') return false;
     for (int i : {0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, 17, 18}) {
@@ -57,7 +56,7 @@ static inline bool parse_iso_f1(std::string_view s, int64_t& out_ms) {
     return true;
 }
 
-static inline bool parse_iso_f2(std::string_view s, int64_t& out_ms) {
+static inline bool parse_iso_f2(std::string_view s, int64_t& out_ms) noexcept {
     if (s.size() != 25 || s[10] != 'T') return false;
     if (s[4] != '-' || s[7] != '-' || s[13] != ':' || s[16] != ':') return false;
     char sign = s[19];
@@ -93,7 +92,7 @@ static inline bool parse_iso_f2(std::string_view s, int64_t& out_ms) {
 
 enum class TsStatus { VALID, OUT_OF_BOUNDS, BAD };
 
-static inline TsStatus parse_ts(std::string_view s, int64_t& out_ms) {
+static inline TsStatus parse_ts(std::string_view s, int64_t& out_ms) noexcept {
     if (s.empty()) return TsStatus::BAD;
     if (s.size() == 20) {
         if (parse_iso_f1(s, out_ms)) return TsStatus::VALID;
@@ -112,46 +111,54 @@ static inline TsStatus parse_ts(std::string_view s, int64_t& out_ms) {
     return TsStatus::VALID;
 }
 
-static inline bool parse_csv_line(std::string_view line, int expected_fields, std::string_view* out_fields) {
-    if (line.empty()) return false;
+static inline bool parse_csv_line(std::string_view line, int expected_fields, std::string_view* out_fields) noexcept {
+    const char* ptr = line.data();
+    const char* end = ptr + line.size();
     int field_idx = 0;
-    size_t start = 0;
-    size_t n = line.size();
-    while (start <= n) {
+    while (ptr <= end) {
         if (field_idx >= expected_fields) return false;
-        size_t comma = line.find(',', start);
-        std::string_view field = (comma == std::string_view::npos) 
-            ? line.substr(start) 
-            : line.substr(start, comma - start);
-
-        size_t first_quote = field.find('"');
-        if (first_quote != std::string_view::npos) {
-            if (field.size() >= 2 && field.front() == '"' && field.back() == '"') {
-                std::string_view inner = field.substr(1, field.size() - 2);
-                if (inner.find('"') != std::string_view::npos) {
-                    return false;
+        const char* f_start = ptr;
+        while (ptr < end && *ptr != ',') ptr++;
+        const char* f_end = ptr;
+        size_t len = f_end - f_start;
+        if (len > 0 && *f_start == '"') {
+            if (len >= 2 && *(f_end - 1) == '"') {
+                for (const char* p = f_start + 1; p < f_end - 1; ++p) {
+                    if (*p == '"') return false;
                 }
-                out_fields[field_idx++] = inner;
+                out_fields[field_idx++] = std::string_view(f_start + 1, len - 2);
             } else {
                 return false;
             }
         } else {
-            out_fields[field_idx++] = field;
+            for (const char* p = f_start; p < f_end; ++p) {
+                if (*p == '"') return false;
+            }
+            out_fields[field_idx++] = std::string_view(f_start, len);
         }
-
-        if (comma == std::string_view::npos) break;
-        start = comma + 1;
+        if (ptr == end) break;
+        ptr++;
     }
     return field_idx == expected_fields;
 }
 
 static inline uint64_t hash_str(std::string_view s) noexcept {
-    uint64_t h = 0xcbf29ce484222325ULL;
-    for (char c : s) {
-        h ^= static_cast<uint8_t>(c);
-        h *= 0x100000001b3ULL;
+    const uint8_t* p = reinterpret_cast<const uint8_t*>(s.data());
+    size_t len = s.size();
+    uint64_t h = len * 0x517cc1b727220a95ULL;
+    while (len >= 8) {
+        uint64_t v;
+        std::memcpy(&v, p, 8);
+        h = (h ^ v) * 0x517cc1b727220a95ULL;
+        p += 8;
+        len -= 8;
     }
-    return h;
+    while (len > 0) {
+        h = (h ^ *p) * 0x517cc1b727220a95ULL;
+        p++;
+        len--;
+    }
+    return h ^ (h >> 32);
 }
 
 class MmapFile {
@@ -159,6 +166,8 @@ public:
     const char* data = nullptr;
     size_t size = 0;
     int fd = -1;
+
+    MmapFile() = default;
 
     MmapFile(const std::string& path) {
         fd = open(path.c_str(), O_RDONLY);
@@ -175,6 +184,8 @@ public:
             data = nullptr;
             close(fd);
             fd = -1;
+        } else {
+            madvise((void*)data, size, MADV_SEQUENTIAL);
         }
     }
 
@@ -187,27 +198,66 @@ public:
         }
     }
 
-    bool is_open() const { return data != nullptr; }
+    MmapFile(MmapFile&& o) noexcept : data(o.data), size(o.size), fd(o.fd) {
+        o.data = nullptr;
+        o.size = 0;
+        o.fd = -1;
+    }
+
+    MmapFile& operator=(MmapFile&& o) noexcept {
+        if (this != &o) {
+            if (data && data != MAP_FAILED) munmap((void*)data, size);
+            if (fd >= 0) close(fd);
+            data = o.data;
+            size = o.size;
+            fd = o.fd;
+            o.data = nullptr;
+            o.size = 0;
+            o.fd = -1;
+        }
+        return *this;
+    }
+
+    bool is_open() const noexcept { return data != nullptr; }
 };
 
-struct DSU {
-    std::unordered_map<std::string, uint32_t> user_to_id;
+struct FlatDSU {
+    struct Entry {
+        uint64_t hash = 0;
+        uint32_t id = 0;
+    };
+    std::vector<Entry> table;
+    size_t mask = 0;
     std::vector<std::string> id_to_user;
     std::vector<uint32_t> parent;
     std::vector<uint32_t> min_id;
 
-    uint32_t get_or_create(const std::string& u) {
-        auto it = user_to_id.find(u);
-        if (it != user_to_id.end()) return it->second;
-        uint32_t id = id_to_user.size();
-        user_to_id[u] = id;
-        id_to_user.push_back(u);
+    void init(size_t cap) {
+        size_t n = 1;
+        while (n < cap * 2) n <<= 1;
+        table.assign(n, Entry{0, 0});
+        mask = n - 1;
+    }
+
+    uint32_t get_or_create(std::string_view u) {
+        uint64_t h = hash_str(u);
+        if (h == 0) h = 1;
+        size_t idx = h & mask;
+        while (table[idx].hash != 0) {
+            if (table[idx].hash == h && id_to_user[table[idx].id] == u) {
+                return table[idx].id;
+            }
+            idx = (idx + 1) & mask;
+        }
+        uint32_t id = static_cast<uint32_t>(id_to_user.size());
+        id_to_user.emplace_back(u);
+        table[idx] = {h, id};
         parent.push_back(id);
         min_id.push_back(id);
         return id;
     }
 
-    uint32_t find(uint32_t i) {
+    uint32_t find(uint32_t i) noexcept {
         uint32_t root = i;
         while (root != parent[root]) root = parent[root];
         uint32_t curr = i;
@@ -219,7 +269,7 @@ struct DSU {
         return root;
     }
 
-    void unite(uint32_t i, uint32_t j) {
+    void unite(uint32_t i, uint32_t j) noexcept {
         uint32_t root_i = find(i);
         uint32_t root_j = find(j);
         if (root_i != root_j) {
@@ -232,70 +282,158 @@ struct DSU {
         }
     }
 
-    std::string get_canonical(std::string_view u) {
-        std::string su(u);
-        auto it = user_to_id.find(su);
-        if (it == user_to_id.end()) return su;
-        uint32_t root = find(it->second);
-        return id_to_user[min_id[root]];
+    std::string_view get_canonical(std::string_view u) noexcept {
+        if (mask == 0) return u;
+        uint64_t h = hash_str(u);
+        if (h == 0) h = 1;
+        size_t idx = h & mask;
+        while (table[idx].hash != 0) {
+            if (table[idx].hash == h && id_to_user[table[idx].id] == u) {
+                uint32_t root = find(table[idx].id);
+                return id_to_user[min_id[root]];
+            }
+            idx = (idx + 1) & mask;
+        }
+        return u;
     }
 };
 
-struct RawEventRecord {
+struct FlatProdMap {
+    struct Entry {
+        uint64_t hash = 0;
+        std::string_view prod;
+        uint16_t cat_idx = 0;
+    };
+    std::vector<Entry> table;
+    size_t mask = 0;
+
+    void init(size_t cap) {
+        size_t n = 1;
+        while (n < cap * 2) n <<= 1;
+        table.assign(n, Entry{});
+        mask = n - 1;
+    }
+
+    void insert(std::string_view prod, uint16_t cidx) {
+        uint64_t h = hash_str(prod);
+        if (h == 0) h = 1;
+        size_t idx = h & mask;
+        while (table[idx].hash != 0) {
+            if (table[idx].hash == h && table[idx].prod == prod) {
+                table[idx].cat_idx = cidx;
+                return;
+            }
+            idx = (idx + 1) & mask;
+        }
+        table[idx] = {h, prod, cidx};
+    }
+
+    uint16_t find(std::string_view prod) const noexcept {
+        if (mask == 0) return 0;
+        uint64_t h = hash_str(prod);
+        if (h == 0) h = 1;
+        size_t idx = h & mask;
+        while (table[idx].hash != 0) {
+            if (table[idx].hash == h && table[idx].prod == prod) {
+                return table[idx].cat_idx;
+            }
+            idx = (idx + 1) & mask;
+        }
+        return 0; // unknown
+    }
+};
+
+struct FlatCampMap {
+    struct Entry {
+        uint64_t hash = 0;
+        std::string_view camp;
+        uint16_t camp_idx = 0;
+    };
+    std::vector<Entry> table;
+    size_t mask = 0;
+
+    void init(size_t cap) {
+        size_t n = 1;
+        while (n < cap * 2) n <<= 1;
+        table.assign(n, Entry{});
+        mask = n - 1;
+    }
+
+    void insert(std::string_view camp, uint16_t idx_val) {
+        uint64_t h = hash_str(camp);
+        if (h == 0) h = 1;
+        size_t idx = h & mask;
+        while (table[idx].hash != 0) {
+            if (table[idx].hash == h && table[idx].camp == camp) {
+                table[idx].camp_idx = idx_val;
+                return;
+            }
+            idx = (idx + 1) & mask;
+        }
+        table[idx] = {h, camp, idx_val};
+    }
+
+    uint16_t find(std::string_view camp) const noexcept {
+        if (mask == 0) return 0;
+        uint64_t h = hash_str(camp);
+        if (h == 0) h = 1;
+        size_t idx = h & mask;
+        while (table[idx].hash != 0) {
+            if (table[idx].hash == h && table[idx].camp == camp) {
+                return table[idx].camp_idx;
+            }
+            idx = (idx + 1) & mask;
+        }
+        return 0;
+    }
+};
+
+// Compact parsed event representation (ZERO HEAP ALLOCATION)
+struct CompactEvent {
+    uint64_t eid_hash;
+    std::string_view eid;
     int64_t ingest_ts_ms;
-    std::string user_id;
-    std::string ts_str;
-    std::string event_type;
-    std::string product_id;
-    std::string price_cents_str;
+    int64_t ts_ms;
+    std::string_view user_id;
+    int32_t price_cents;
+    uint16_t cat_idx;
+    uint8_t ev_type;
+    uint8_t is_valid;
 };
 
-struct EventItem {
+struct CompactClick {
+    uint64_t cid_hash;
+    std::string_view cid;
+    int64_t ts_ms;
+    std::string_view user_id;
+    uint16_t camp_idx;
+    uint8_t is_valid;
+};
+
+struct PersonEvent {
+    uint64_t pid_hash;
+    std::string_view person_id;
     int64_t ts;
+    int32_t price_cents;
+    uint16_t cat_idx;
     uint8_t type;
-    int64_t price_cents;
-    std::string category;
 };
 
-struct ClickItem {
-    std::string click_id;
-    std::string campaign_id;
+struct PersonClick {
+    uint64_t pid_hash;
+    std::string_view person_id;
     int64_t ts;
+    std::string_view cid;
+    uint16_t camp_idx;
 };
 
-struct RawClickRecord {
-    std::string click_id;
-    std::string user_id;
-    std::string campaign_id;
-    std::string ts_str;
-};
-
-struct AggKey {
-    std::string id;
+struct UserDailyRow {
+    std::string_view user_id;
     int32_t day;
-    bool operator==(const AggKey& o) const {
-        return day == o.day && id == o.id;
-    }
-};
-
-struct AggKeyHash {
-    size_t operator()(const AggKey& k) const {
-        return std::hash<std::string>()(k.id) ^ (static_cast<size_t>(k.day) * 0x9e3779b97f4a7c15ULL);
-    }
-};
-
-struct UserDailyStats {
-    int64_t sessions = 0;
-    int64_t events = 0;
-    int64_t revenue_cents = 0;
-    std::unordered_map<std::string, int64_t> cat_rev;
-};
-
-struct CampaignDailyStats {
-    int64_t sessions = 0;
-    int64_t purchasing_sessions = 0;
-    int64_t revenue_cents = 0;
-    int64_t assisted_sessions = 0;
+    int64_t sessions;
+    int64_t events;
+    int64_t revenue_cents;
+    std::string_view top_category;
 };
 
 int main(int argc, char* argv[]) {
@@ -336,61 +474,78 @@ int main(int argc, char* argv[]) {
         parse_iso_f1(we, win_end_ms);
     }
     int64_t click_win_start_ms = win_start_ms - 7LL * 86400 * 1000;
+    int32_t win_start_day = static_cast<int32_t>(win_start_ms / 86400000);
+    int num_window_days = static_cast<int>((win_end_ms - win_start_ms + 86399999) / 86400000) + 1;
+    if (num_window_days < 16) num_window_days = 16;
 
-    // 2. Read products.csv
-    std::unordered_map<std::string, std::string> products;
-    {
-        MmapFile mf(data_dir + "/products.csv");
-        if (mf.is_open()) {
-            const char* cur = mf.data;
-            const char* end = mf.data + mf.size;
+    // 2. Read products.csv (keep mmap open!)
+    std::vector<std::string> cat_names = {"unknown"};
+    FlatProdMap prod_to_cat;
+    prod_to_cat.init(65536);
+    MmapFile prod_mf(data_dir + "/products.csv");
+    if (prod_mf.is_open()) {
+        const char* cur = prod_mf.data;
+        const char* end = prod_mf.data + prod_mf.size;
+        while (cur < end && *cur != '\n') cur++;
+        if (cur < end && *cur == '\n') cur++;
+
+        std::string_view fields[4];
+        while (cur < end) {
+            const char* line_start = cur;
             while (cur < end && *cur != '\n') cur++;
+            std::string_view line(line_start, cur - line_start);
             if (cur < end && *cur == '\n') cur++;
 
-            std::string_view fields[4];
-            while (cur < end) {
-                const char* line_start = cur;
-                while (cur < end && *cur != '\n') cur++;
-                std::string_view line(line_start, cur - line_start);
-                if (cur < end && *cur == '\n') cur++;
-
-                if (parse_csv_line(line, 2, fields)) {
-                    if (!fields[0].empty()) {
-                        products[std::string(fields[0])] = std::string(fields[1]);
+            if (parse_csv_line(line, 2, fields)) {
+                if (!fields[0].empty()) {
+                    uint16_t cidx = 0;
+                    for (size_t c = 0; c < cat_names.size(); ++c) {
+                        if (cat_names[c] == fields[1]) {
+                            cidx = c;
+                            break;
+                        }
                     }
+                    if (cidx == 0 && fields[1] != "unknown") {
+                        cidx = cat_names.size();
+                        cat_names.emplace_back(fields[1]);
+                    }
+                    prod_to_cat.insert(fields[0], cidx);
                 }
             }
         }
     }
 
-    // 3. Read campaigns.csv
-    std::unordered_map<std::string, std::string> campaigns;
-    {
-        MmapFile mf(data_dir + "/campaigns.csv");
-        if (mf.is_open()) {
-            const char* cur = mf.data;
-            const char* end = mf.data + mf.size;
+    // 3. Read campaigns.csv (keep mmap open!)
+    std::vector<std::pair<std::string_view, std::string_view>> camp_list = {{"organic", "organic"}};
+    FlatCampMap camp_to_idx;
+    camp_to_idx.init(4096);
+    MmapFile camp_mf(data_dir + "/campaigns.csv");
+    if (camp_mf.is_open()) {
+        const char* cur = camp_mf.data;
+        const char* end = camp_mf.data + camp_mf.size;
+        while (cur < end && *cur != '\n') cur++;
+        if (cur < end && *cur == '\n') cur++;
+
+        std::string_view fields[4];
+        while (cur < end) {
+            const char* line_start = cur;
             while (cur < end && *cur != '\n') cur++;
+            std::string_view line(line_start, cur - line_start);
             if (cur < end && *cur == '\n') cur++;
 
-            std::string_view fields[4];
-            while (cur < end) {
-                const char* line_start = cur;
-                while (cur < end && *cur != '\n') cur++;
-                std::string_view line(line_start, cur - line_start);
-                if (cur < end && *cur == '\n') cur++;
-
-                if (parse_csv_line(line, 2, fields)) {
-                    if (!fields[0].empty()) {
-                        campaigns[std::string(fields[0])] = std::string(fields[1]);
-                    }
+            if (parse_csv_line(line, 2, fields)) {
+                if (!fields[0].empty()) {
+                    uint16_t idx = camp_list.size();
+                    camp_to_idx.insert(fields[0], idx);
+                    camp_list.emplace_back(fields[0], fields[1]);
                 }
             }
         }
     }
 
     // 4. Read links/*.csv
-    DSU dsu;
+    FlatDSU dsu;
+    dsu.init(262144);
     {
         std::vector<std::string> link_files;
         if (fs::is_directory(data_dir + "/links")) {
@@ -419,8 +574,8 @@ int main(int argc, char* argv[]) {
 
                 if (parse_csv_line(line, 2, fields)) {
                     if (!fields[0].empty() && !fields[1].empty()) {
-                        uint32_t id1 = dsu.get_or_create(std::string(fields[0]));
-                        uint32_t id2 = dsu.get_or_create(std::string(fields[1]));
+                        uint32_t id1 = dsu.get_or_create(fields[0]);
+                        uint32_t id2 = dsu.get_or_create(fields[1]);
                         dsu.unite(id1, id2);
                     }
                 }
@@ -428,7 +583,7 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    // 5. Read events/*.csv
+    // 5. Memory map all events/*.csv files
     std::vector<std::pair<size_t, std::string>> ev_files_with_size;
     if (fs::is_directory(data_dir + "/events")) {
         for (const auto& entry : fs::directory_iterator(data_dir + "/events")) {
@@ -439,24 +594,34 @@ int main(int argc, char* argv[]) {
     }
     std::sort(ev_files_with_size.rbegin(), ev_files_with_size.rend());
 
+    std::vector<MmapFile> ev_mmaps(ev_files_with_size.size());
+    for (size_t i = 0; i < ev_files_with_size.size(); ++i) {
+        ev_mmaps[i] = MmapFile(ev_files_with_size[i].second);
+    }
+
     const size_t NUM_SHARDS = 64;
-    std::vector<std::vector<std::vector<std::pair<std::string, RawEventRecord>>>> thread_event_shards(
-        num_threads, std::vector<std::vector<std::pair<std::string, RawEventRecord>>>(NUM_SHARDS)
+    std::vector<std::vector<std::vector<CompactEvent>>> thread_event_shards(
+        num_threads, std::vector<std::vector<CompactEvent>>(NUM_SHARDS)
     );
+    for (size_t t = 0; t < num_threads; ++t) {
+        for (size_t s = 0; s < NUM_SHARDS; ++s) {
+            thread_event_shards[t][s].reserve(8192);
+        }
+    }
 
     {
         std::vector<std::thread> workers;
         std::atomic<size_t> file_idx{0};
 
         for (size_t t = 0; t < num_threads; ++t) {
-            workers.emplace_back([t, &file_idx, &ev_files_with_size, &thread_event_shards]() {
+            workers.emplace_back([t, &file_idx, &ev_mmaps, &thread_event_shards,
+                                  &prod_to_cat, win_start_ms, win_end_ms]() {
                 std::string_view fields[8];
                 while (true) {
                     size_t idx = file_idx.fetch_add(1);
-                    if (idx >= ev_files_with_size.size()) break;
+                    if (idx >= ev_mmaps.size()) break;
 
-                    const auto& ef = ev_files_with_size[idx].second;
-                    MmapFile mf(ef);
+                    const auto& mf = ev_mmaps[idx];
                     if (!mf.is_open()) continue;
                     const char* cur = mf.data;
                     const char* end = mf.data + mf.size;
@@ -470,24 +635,75 @@ int main(int argc, char* argv[]) {
                         if (cur < end && *cur == '\n') cur++;
 
                         if (parse_csv_line(line, 7, fields)) {
-                            if (fields[0].empty()) continue;
+                            std::string_view eid = fields[0];
+                            if (eid.empty()) continue;
+
                             int64_t ingest_ts_ms = 0;
                             if (!parse_iso_f1(fields[3], ingest_ts_ms)) continue;
 
-                            std::string eid(fields[0]);
-                            size_t shard = hash_str(eid) % NUM_SHARDS;
+                            // Inline pre-validation of this copy
+                            bool valid = true;
+                            std::string_view uid = fields[1];
+                            if (uid.empty()) valid = false;
 
-                            thread_event_shards[t][shard].emplace_back(
-                                std::move(eid),
-                                RawEventRecord{
-                                    ingest_ts_ms,
-                                    std::string(fields[1]),
-                                    std::string(fields[2]),
-                                    std::string(fields[4]),
-                                    std::string(fields[5]),
-                                    std::string(fields[6])
+                            int64_t ts_ms = 0;
+                            if (valid) {
+                                TsStatus st = parse_ts(fields[2], ts_ms);
+                                if (st != TsStatus::VALID || ts_ms < win_start_ms || ts_ms >= win_end_ms) {
+                                    valid = false;
                                 }
-                            );
+                            }
+
+                            uint8_t ev_type = 255;
+                            if (valid) {
+                                if (fields[4] == "view") ev_type = 0;
+                                else if (fields[4] == "cart") ev_type = 1;
+                                else if (fields[4] == "purchase") ev_type = 2;
+                                else valid = false;
+                            }
+
+                            uint16_t cidx = 0;
+                            if (valid) {
+                                if (fields[5].empty()) {
+                                    valid = false;
+                                } else {
+                                    cidx = prod_to_cat.find(fields[5]);
+                                }
+                            }
+
+                            int32_t price = 0;
+                            if (valid && ev_type == 2) {
+                                std::string_view pstr = fields[6];
+                                if (pstr.empty() || pstr.size() > 10) {
+                                    valid = false;
+                                } else {
+                                    int64_t pval = 0;
+                                    for (char c : pstr) {
+                                        if (c < '0' || c > '9') { valid = false; break; }
+                                        pval = pval * 10 + (c - '0');
+                                    }
+                                    if (pval < 1 || pval > 10000000) valid = false;
+                                    else price = static_cast<int32_t>(pval);
+                                }
+                            }
+
+                            if (valid && (ingest_ts_ms - ts_ms > 86400000)) {
+                                valid = false;
+                            }
+
+                            uint64_t eid_h = hash_str(eid);
+                            size_t shard = eid_h & (NUM_SHARDS - 1);
+                            thread_event_shards[t][shard].push_back(CompactEvent{
+                                eid_h,
+                                eid,
+                                ingest_ts_ms,
+                                ts_ms,
+                                uid,
+                                price,
+                                cidx,
+                                ev_type,
+                                static_cast<uint8_t>(valid ? 1 : 0)
+                            });
                         }
                     }
                 }
@@ -496,10 +712,15 @@ int main(int argc, char* argv[]) {
         for (auto& w : workers) w.join();
     }
 
-    // 6. Deduplicate & Validate events
-    std::vector<std::vector<std::unordered_map<std::string, std::vector<EventItem>>>> thread_person_events(
-        num_threads, std::vector<std::unordered_map<std::string, std::vector<EventItem>>>(NUM_SHARDS)
+    // 6. Deduplicate & Validate events, partition into person_shards
+    std::vector<std::vector<std::vector<PersonEvent>>> thread_person_events(
+        num_threads, std::vector<std::vector<PersonEvent>>(NUM_SHARDS)
     );
+    for (size_t t = 0; t < num_threads; ++t) {
+        for (size_t s = 0; s < NUM_SHARDS; ++s) {
+            thread_person_events[t][s].reserve(8192);
+        }
+    }
 
     {
         std::vector<std::thread> workers;
@@ -507,63 +728,67 @@ int main(int argc, char* argv[]) {
 
         for (size_t t = 0; t < num_threads; ++t) {
             workers.emplace_back([t, &shard_idx, &thread_event_shards, &thread_person_events,
-                                  &dsu, &products, win_start_ms, win_end_ms, num_threads]() {
+                                  &dsu, num_threads]() {
+                struct DedupEntry {
+                    uint64_t hash = 0;
+                    uint32_t th = 0;
+                    uint32_t idx = 0;
+                };
+
                 while (true) {
                     size_t s = shard_idx.fetch_add(1);
                     if (s >= NUM_SHARDS) break;
 
-                    std::unordered_map<std::string, RawEventRecord> smap;
-                    for (size_t th = 0; th < num_threads; ++th) {
-                        for (auto& [eid, raw] : thread_event_shards[th][s]) {
-                            auto it = smap.find(eid);
-                            if (it == smap.end() || raw.ingest_ts_ms < it->second.ingest_ts_ms) {
-                                smap[eid] = std::move(raw);
+                    size_t total_s = 0;
+                    for (size_t th = 0; th < num_threads; ++th) total_s += thread_event_shards[th][s].size();
+                    if (total_s == 0) continue;
+
+                    size_t cap = 1;
+                    while (cap < total_s * 2) cap <<= 1;
+                    if (cap < 64) cap = 64;
+                    size_t mask = cap - 1;
+
+                    std::vector<DedupEntry> table(cap, DedupEntry{0, 0, 0});
+
+                    for (uint32_t th = 0; th < num_threads; ++th) {
+                        const auto& s_vec = thread_event_shards[th][s];
+                        for (uint32_t i = 0; i < s_vec.size(); ++i) {
+                            uint64_t h = s_vec[i].eid_hash;
+                            if (h == 0) h = 1;
+                            size_t idx = h & mask;
+                            while (table[idx].hash != 0) {
+                                if (table[idx].hash == h &&
+                                    thread_event_shards[table[idx].th][s][table[idx].idx].eid == s_vec[i].eid) {
+                                    if (s_vec[i].ingest_ts_ms < thread_event_shards[table[idx].th][s][table[idx].idx].ingest_ts_ms) {
+                                        table[idx].th = th;
+                                        table[idx].idx = i;
+                                    }
+                                    break;
+                                }
+                                idx = (idx + 1) & mask;
+                            }
+                            if (table[idx].hash == 0) {
+                                table[idx] = {h, th, i};
                             }
                         }
-                        thread_event_shards[th][s].clear();
                     }
 
-                    for (auto& [eid, raw] : smap) {
-                        if (raw.user_id.empty()) continue;
-                        int64_t ts_ms = 0;
-                        TsStatus status = parse_ts(raw.ts_str, ts_ms);
-                        if (status != TsStatus::VALID) continue;
-                        if (ts_ms < win_start_ms || ts_ms >= win_end_ms) continue;
+                    for (size_t i = 0; i < cap; ++i) {
+                        if (table[i].hash == 0) continue;
+                        const auto& ev = thread_event_shards[table[i].th][s][table[i].idx];
+                        if (!ev.is_valid) continue;
 
-                        uint8_t ev_type = 255;
-                        if (raw.event_type == "view") ev_type = 0;
-                        else if (raw.event_type == "cart") ev_type = 1;
-                        else if (raw.event_type == "purchase") ev_type = 2;
-                        else continue;
+                        std::string_view can_uid = dsu.get_canonical(ev.user_id);
+                        uint64_t pid_h = hash_str(can_uid);
+                        size_t pshard = pid_h & (NUM_SHARDS - 1);
 
-                        if (raw.product_id.empty()) continue;
-
-                        int64_t price_cents = 0;
-                        if (ev_type == 2) {
-                            if (raw.price_cents_str.empty()) continue;
-                            bool ok = true;
-                            for (char c : raw.price_cents_str) {
-                                if (c < '0' || c > '9') { ok = false; break; }
-                            }
-                            if (!ok) continue;
-                            if (raw.price_cents_str.size() > 10) continue;
-                            price_cents = std::stoll(raw.price_cents_str);
-                            if (price_cents < 1 || price_cents > 10000000) continue;
-                        }
-
-                        if (raw.ingest_ts_ms - ts_ms > 86400000) continue;
-
-                        std::string person_id = dsu.get_canonical(raw.user_id);
-                        std::string category = "unknown";
-                        auto pit = products.find(raw.product_id);
-                        if (pit != products.end()) category = pit->second;
-
-                        size_t pshard = hash_str(person_id) % NUM_SHARDS;
-                        thread_person_events[t][pshard][person_id].push_back(EventItem{
-                            ts_ms,
-                            ev_type,
-                            price_cents,
-                            std::move(category)
+                        thread_person_events[t][pshard].push_back(PersonEvent{
+                            pid_h,
+                            can_uid,
+                            ev.ts_ms,
+                            ev.price_cents,
+                            ev.cat_idx,
+                            ev.ev_type
                         });
                     }
                 }
@@ -573,7 +798,7 @@ int main(int argc, char* argv[]) {
     }
     thread_event_shards.clear();
 
-    // 7. Read clicks/*.csv
+    // 7. Memory map clicks/*.csv files
     std::vector<std::pair<size_t, std::string>> clk_files_with_size;
     if (fs::is_directory(data_dir + "/clicks")) {
         for (const auto& entry : fs::directory_iterator(data_dir + "/clicks")) {
@@ -584,8 +809,13 @@ int main(int argc, char* argv[]) {
     }
     std::sort(clk_files_with_size.rbegin(), clk_files_with_size.rend());
 
-    std::vector<std::vector<std::vector<std::pair<std::string, RawClickRecord>>>> thread_click_shards(
-        num_threads, std::vector<std::vector<std::pair<std::string, RawClickRecord>>>(NUM_SHARDS)
+    std::vector<MmapFile> clk_mmaps(clk_files_with_size.size());
+    for (size_t i = 0; i < clk_files_with_size.size(); ++i) {
+        clk_mmaps[i] = MmapFile(clk_files_with_size[i].second);
+    }
+
+    std::vector<std::vector<std::vector<CompactClick>>> thread_click_shards(
+        num_threads, std::vector<std::vector<CompactClick>>(NUM_SHARDS)
     );
 
     {
@@ -593,14 +823,14 @@ int main(int argc, char* argv[]) {
         std::atomic<size_t> file_idx{0};
 
         for (size_t t = 0; t < num_threads; ++t) {
-            workers.emplace_back([t, &file_idx, &clk_files_with_size, &thread_click_shards]() {
+            workers.emplace_back([t, &file_idx, &clk_mmaps, &thread_click_shards,
+                                  &camp_to_idx, click_win_start_ms, win_end_ms]() {
                 std::string_view fields[8];
                 while (true) {
                     size_t idx = file_idx.fetch_add(1);
-                    if (idx >= clk_files_with_size.size()) break;
+                    if (idx >= clk_mmaps.size()) break;
 
-                    const auto& cf = clk_files_with_size[idx].second;
-                    MmapFile mf(cf);
+                    const auto& mf = clk_mmaps[idx];
                     if (!mf.is_open()) continue;
                     const char* cur = mf.data;
                     const char* end = mf.data + mf.size;
@@ -614,19 +844,36 @@ int main(int argc, char* argv[]) {
                         if (cur < end && *cur == '\n') cur++;
 
                         if (parse_csv_line(line, 4, fields)) {
-                            if (fields[0].empty()) continue;
-                            std::string cid(fields[0]);
-                            size_t shard = hash_str(cid) % NUM_SHARDS;
+                            std::string_view cid = fields[0];
+                            if (cid.empty()) continue;
 
-                            thread_click_shards[t][shard].emplace_back(
-                                std::move(cid),
-                                RawClickRecord{
-                                    std::string(fields[0]),
-                                    std::string(fields[1]),
-                                    std::string(fields[2]),
-                                    std::string(fields[3])
+                            bool valid = true;
+                            if (fields[1].empty()) valid = false;
+
+                            uint16_t c_idx = 0;
+                            if (valid) {
+                                c_idx = camp_to_idx.find(fields[2]);
+                                if (c_idx == 0) valid = false;
+                            }
+
+                            int64_t ts_ms = 0;
+                            if (valid) {
+                                TsStatus st = parse_ts(fields[3], ts_ms);
+                                if (st != TsStatus::VALID || ts_ms < click_win_start_ms || ts_ms >= win_end_ms) {
+                                    valid = false;
                                 }
-                            );
+                            }
+
+                            uint64_t cid_h = hash_str(cid);
+                            size_t shard = cid_h & (NUM_SHARDS - 1);
+                            thread_click_shards[t][shard].push_back(CompactClick{
+                                cid_h,
+                                cid,
+                                ts_ms,
+                                fields[1],
+                                c_idx,
+                                static_cast<uint8_t>(valid ? 1 : 0)
+                            });
                         }
                     }
                 }
@@ -635,9 +882,9 @@ int main(int argc, char* argv[]) {
         for (auto& w : workers) w.join();
     }
 
-    // 8. Deduplicate & Validate clicks
-    std::vector<std::vector<std::unordered_map<std::string, std::vector<ClickItem>>>> thread_person_clicks(
-        num_threads, std::vector<std::unordered_map<std::string, std::vector<ClickItem>>>(NUM_SHARDS)
+    // 8. Deduplicate clicks and partition into person_shards
+    std::vector<std::vector<std::vector<PersonClick>>> thread_person_clicks(
+        num_threads, std::vector<std::vector<PersonClick>>(NUM_SHARDS)
     );
 
     {
@@ -646,36 +893,62 @@ int main(int argc, char* argv[]) {
 
         for (size_t t = 0; t < num_threads; ++t) {
             workers.emplace_back([t, &shard_idx, &thread_click_shards, &thread_person_clicks,
-                                  &dsu, &campaigns, click_win_start_ms, win_end_ms, num_threads]() {
+                                  &dsu, num_threads]() {
+                struct ClickDedupEntry {
+                    uint64_t hash = 0;
+                    uint32_t th = 0;
+                    uint32_t idx = 0;
+                };
+
                 while (true) {
                     size_t s = shard_idx.fetch_add(1);
                     if (s >= NUM_SHARDS) break;
 
-                    std::unordered_map<std::string, RawClickRecord> cmap;
-                    for (size_t th = 0; th < num_threads; ++th) {
-                        for (auto& [cid, raw] : thread_click_shards[th][s]) {
-                            if (cmap.find(cid) == cmap.end()) {
-                                cmap[cid] = std::move(raw);
+                    size_t total_c = 0;
+                    for (size_t th = 0; th < num_threads; ++th) total_c += thread_click_shards[th][s].size();
+                    if (total_c == 0) continue;
+
+                    size_t cap = 1;
+                    while (cap < total_c * 2) cap <<= 1;
+                    if (cap < 64) cap = 64;
+                    size_t mask = cap - 1;
+
+                    std::vector<ClickDedupEntry> table(cap, ClickDedupEntry{0, 0, 0});
+
+                    for (uint32_t th = 0; th < num_threads; ++th) {
+                        const auto& s_vec = thread_click_shards[th][s];
+                        for (uint32_t i = 0; i < s_vec.size(); ++i) {
+                            uint64_t h = s_vec[i].cid_hash;
+                            if (h == 0) h = 1;
+                            size_t idx = h & mask;
+                            while (table[idx].hash != 0) {
+                                if (table[idx].hash == h &&
+                                    thread_click_shards[table[idx].th][s][table[idx].idx].cid == s_vec[i].cid) {
+                                    break; // already present, duplicates are identical
+                                }
+                                idx = (idx + 1) & mask;
+                            }
+                            if (table[idx].hash == 0) {
+                                table[idx] = {h, th, i};
                             }
                         }
-                        thread_click_shards[th][s].clear();
                     }
 
-                    for (auto& [cid, raw] : cmap) {
-                        if (raw.user_id.empty()) continue;
-                        if (campaigns.find(raw.campaign_id) == campaigns.end()) continue;
-                        int64_t ts_ms = 0;
-                        TsStatus status = parse_ts(raw.ts_str, ts_ms);
-                        if (status != TsStatus::VALID) continue;
-                        if (ts_ms < click_win_start_ms || ts_ms >= win_end_ms) continue;
+                    for (size_t i = 0; i < cap; ++i) {
+                        if (table[i].hash == 0) continue;
+                        const auto& clk = thread_click_shards[table[i].th][s][table[i].idx];
+                        if (!clk.is_valid) continue;
 
-                        std::string person_id = dsu.get_canonical(raw.user_id);
-                        size_t pshard = hash_str(person_id) % NUM_SHARDS;
+                        std::string_view can_uid = dsu.get_canonical(clk.user_id);
+                        uint64_t pid_h = hash_str(can_uid);
+                        size_t pshard = pid_h & (NUM_SHARDS - 1);
 
-                        thread_person_clicks[t][pshard][person_id].push_back(ClickItem{
-                            std::move(raw.click_id),
-                            std::move(raw.campaign_id),
-                            ts_ms
+                        thread_person_clicks[t][pshard].push_back(PersonClick{
+                            pid_h,
+                            can_uid,
+                            clk.ts_ms,
+                            clk.cid,
+                            clk.camp_idx
                         });
                     }
                 }
@@ -686,8 +959,17 @@ int main(int argc, char* argv[]) {
     thread_click_shards.clear();
 
     // 9. Sessionize and Aggregate per person shard
-    std::vector<std::unordered_map<AggKey, UserDailyStats, AggKeyHash>> final_user_daily(NUM_SHARDS);
-    std::vector<std::unordered_map<AggKey, CampaignDailyStats, AggKeyHash>> final_campaign_daily(NUM_SHARDS);
+    struct ShardCdStats {
+        int64_t sessions = 0;
+        int64_t purchasing = 0;
+        int64_t revenue = 0;
+        int64_t assisted = 0;
+    };
+
+    std::vector<std::vector<UserDailyRow>> shard_user_daily_rows(NUM_SHARDS);
+    std::vector<std::vector<ShardCdStats>> shard_camp_stats(
+        NUM_SHARDS, std::vector<ShardCdStats>(camp_list.size() * num_window_days)
+    );
 
     const int64_t SEVEN_DAYS = 7LL * 86400 * 1000;
     const int64_t THIRTY_MINS = 1800000;
@@ -698,138 +980,208 @@ int main(int argc, char* argv[]) {
 
         for (size_t t = 0; t < num_threads; ++t) {
             workers.emplace_back([&pshard_idx, &thread_person_events, &thread_person_clicks,
-                                  &final_user_daily, &final_campaign_daily,
-                                  num_threads, SEVEN_DAYS, THIRTY_MINS]() {
+                                  &shard_user_daily_rows, &shard_camp_stats,
+                                  &cat_names, &camp_list, num_threads, SEVEN_DAYS, THIRTY_MINS,
+                                  win_start_day, num_window_days]() {
+                struct UdStats {
+                    int64_t sessions = 0;
+                    int64_t events = 0;
+                    int64_t revenue = 0;
+                    int64_t cat_rev[32] = {0};
+                };
+
+                std::vector<UdStats> user_days(num_window_days);
+                std::vector<int> visited_days;
+                visited_days.reserve(32);
+
                 while (true) {
                     size_t ps = pshard_idx.fetch_add(1);
                     if (ps >= NUM_SHARDS) break;
 
-                    std::unordered_map<std::string, std::vector<EventItem>> person_events;
+                    auto& my_camp_stats = shard_camp_stats[ps];
+
+                    // Flatten and sort events for this shard by (pid_hash, person_id, ts)
+                    size_t total_ev = 0;
+                    for (size_t th = 0; th < num_threads; ++th) total_ev += thread_person_events[th][ps].size();
+                    std::vector<PersonEvent> ps_events;
+                    ps_events.reserve(total_ev);
                     for (size_t th = 0; th < num_threads; ++th) {
-                        for (auto& [pid, evs] : thread_person_events[th][ps]) {
-                            auto& dst = person_events[pid];
-                            dst.insert(dst.end(), std::make_move_iterator(evs.begin()), std::make_move_iterator(evs.end()));
-                        }
+                        ps_events.insert(ps_events.end(), thread_person_events[th][ps].begin(), thread_person_events[th][ps].end());
                         thread_person_events[th][ps].clear();
                     }
+                    std::sort(ps_events.begin(), ps_events.end(), [](const PersonEvent& a, const PersonEvent& b) {
+                        if (a.pid_hash != b.pid_hash) return a.pid_hash < b.pid_hash;
+                        if (a.person_id != b.person_id) return a.person_id < b.person_id;
+                        return a.ts < b.ts;
+                    });
 
-                    std::unordered_map<std::string, std::vector<ClickItem>> person_clicks;
+                    // Flatten and sort clicks for this shard by (pid_hash, person_id, ts, cid)
+                    size_t total_cl = 0;
+                    for (size_t th = 0; th < num_threads; ++th) total_cl += thread_person_clicks[th][ps].size();
+                    std::vector<PersonClick> ps_clicks;
+                    ps_clicks.reserve(total_cl);
                     for (size_t th = 0; th < num_threads; ++th) {
-                        for (auto& [pid, cls] : thread_person_clicks[th][ps]) {
-                            auto& dst = person_clicks[pid];
-                            dst.insert(dst.end(), std::make_move_iterator(cls.begin()), std::make_move_iterator(cls.end()));
-                        }
+                        ps_clicks.insert(ps_clicks.end(), thread_person_clicks[th][ps].begin(), thread_person_clicks[th][ps].end());
                         thread_person_clicks[th][ps].clear();
                     }
+                    std::sort(ps_clicks.begin(), ps_clicks.end(), [](const PersonClick& a, const PersonClick& b) {
+                        if (a.pid_hash != b.pid_hash) return a.pid_hash < b.pid_hash;
+                        if (a.person_id != b.person_id) return a.person_id < b.person_id;
+                        if (a.ts != b.ts) return a.ts < b.ts;
+                        return a.cid < b.cid;
+                    });
 
-                    for (auto& [pid, clist] : person_clicks) {
-                        std::sort(clist.begin(), clist.end(), [](const ClickItem& a, const ClickItem& b) {
-                            if (a.ts != b.ts) return a.ts < b.ts;
-                            return a.click_id < b.click_id;
-                        });
-                    }
+                    // Two-pointer / linear grouping by person
+                    size_t ev_idx = 0;
+                    size_t clk_idx = 0;
 
-                    auto& user_daily_agg = final_user_daily[ps];
-                    auto& campaign_daily_agg = final_campaign_daily[ps];
+                    while (ev_idx < ps_events.size()) {
+                        size_t ev_end = ev_idx + 1;
+                        uint64_t cur_pid_h = ps_events[ev_idx].pid_hash;
+                        std::string_view cur_pid = ps_events[ev_idx].person_id;
 
-                    for (auto& [person_id, ev_list] : person_events) {
-                        std::sort(ev_list.begin(), ev_list.end(), [](const EventItem& a, const EventItem& b) {
-                            return a.ts < b.ts;
-                        });
-
-                        struct Session {
-                            int64_t start_ts;
-                            std::vector<size_t> event_indices;
-                        };
-                        std::vector<Session> sessions;
-                        int64_t prev_distinct_ts = -1;
-
-                        for (size_t i = 0; i < ev_list.size(); ++i) {
-                            int64_t ev_ts = ev_list[i].ts;
-                            if (sessions.empty()) {
-                                sessions.push_back(Session{ev_ts, {i}});
-                                prev_distinct_ts = ev_ts;
-                            } else {
-                                if (ev_ts == prev_distinct_ts) {
-                                    sessions.back().event_indices.push_back(i);
-                                } else {
-                                    if (ev_ts - prev_distinct_ts > THIRTY_MINS) {
-                                        sessions.push_back(Session{ev_ts, {i}});
-                                    } else {
-                                        sessions.back().event_indices.push_back(i);
-                                    }
-                                    prev_distinct_ts = ev_ts;
-                                }
-                            }
+                        while (ev_end < ps_events.size() &&
+                               ps_events[ev_end].pid_hash == cur_pid_h &&
+                               ps_events[ev_end].person_id == cur_pid) {
+                            ev_end++;
                         }
 
-                        const auto* pclicks = person_clicks.count(person_id) ? &person_clicks[person_id] : nullptr;
+                        // Advance clk_idx to match this person
+                        while (clk_idx < ps_clicks.size() &&
+                               (ps_clicks[clk_idx].pid_hash < cur_pid_h ||
+                                (ps_clicks[clk_idx].pid_hash == cur_pid_h && ps_clicks[clk_idx].person_id < cur_pid))) {
+                            clk_idx++;
+                        }
 
-                        for (const auto& sess : sessions) {
-                            int64_t s_start = sess.start_ts;
+                        size_t clk_start = clk_idx;
+                        while (clk_idx < ps_clicks.size() &&
+                               ps_clicks[clk_idx].pid_hash == cur_pid_h &&
+                               ps_clicks[clk_idx].person_id == cur_pid) {
+                            clk_idx++;
+                        }
+                        size_t clk_end = clk_idx;
+
+                        // Sessionize this person's events in ps_events[ev_idx .. ev_end]
+                        visited_days.clear();
+
+                        size_t sess_start_idx = ev_idx;
+                        int64_t sess_start_ts = ps_events[ev_idx].ts;
+                        int64_t prev_distinct_ts = sess_start_ts;
+
+                        auto process_session = [&](size_t s_begin, size_t s_finish, int64_t s_start) {
                             int32_t s_day = static_cast<int32_t>(s_start / 86400000);
+                            int day_offset = s_day - win_start_day;
+                            if (day_offset < 0 || day_offset >= num_window_days) return;
+
+                            if (user_days[day_offset].sessions == 0) {
+                                visited_days.push_back(day_offset);
+                            }
 
                             int64_t s_revenue = 0;
                             bool s_has_purchase = false;
-                            AggKey ud_key{person_id, s_day};
-                            auto& ud = user_daily_agg[ud_key];
+                            auto& ud = user_days[day_offset];
                             ud.sessions++;
-                            ud.events += sess.event_indices.size();
+                            ud.events += (s_finish - s_begin);
 
-                            for (size_t idx : sess.event_indices) {
-                                const auto& ev = ev_list[idx];
+                            for (size_t i = s_begin; i < s_finish; ++i) {
+                                const auto& ev = ps_events[i];
                                 if (ev.type == 2) {
                                     s_revenue += ev.price_cents;
                                     s_has_purchase = true;
-                                    ud.cat_rev[ev.category] += ev.price_cents;
+                                    if (ev.cat_idx < 32) ud.cat_rev[ev.cat_idx] += ev.price_cents;
                                 }
                             }
-                            ud.revenue_cents += s_revenue;
+                            ud.revenue += s_revenue;
 
-                            std::string credited_camp = "organic";
-                            std::unordered_set<std::string> assisting_camps;
+                            uint16_t cred_camp_idx = 0; // organic
+                            std::vector<uint16_t> asst_list;
 
-                            if (pclicks && !pclicks->empty()) {
-                                int64_t min_click_ts = s_start - SEVEN_DAYS;
-                                int64_t max_click_ts = s_start;
+                            if (clk_start < clk_end) {
+                                int64_t min_clk = s_start - SEVEN_DAYS;
+                                int64_t max_clk = s_start;
 
-                                auto it_start = std::lower_bound(pclicks->begin(), pclicks->end(), min_click_ts,
-                                    [](const ClickItem& c, int64_t val) { return c.ts < val; });
-                                auto it_end = std::upper_bound(pclicks->begin(), pclicks->end(), max_click_ts,
-                                    [](int64_t val, const ClickItem& c) { return val < c.ts; });
+                                const PersonClick* p_first = &ps_clicks[clk_start];
+                                size_t n_clks = clk_end - clk_start;
 
-                                const ClickItem* best_click = nullptr;
-                                for (auto it = it_start; it != it_end; ++it) {
-                                    assisting_camps.insert(it->campaign_id);
-                                    if (!best_click) {
-                                        best_click = &(*it);
+                                auto it_s = std::lower_bound(p_first, p_first + n_clks, min_clk,
+                                    [](const PersonClick& c, int64_t val) { return c.ts < val; });
+                                auto it_e = std::upper_bound(p_first, p_first + n_clks, max_clk,
+                                    [](int64_t val, const PersonClick& c) { return val < c.ts; });
+
+                                const PersonClick* best_clk = nullptr;
+                                for (auto it = it_s; it != it_e; ++it) {
+                                    asst_list.push_back(it->camp_idx);
+                                    if (!best_clk) {
+                                        best_clk = it;
                                     } else {
-                                        if (it->ts > best_click->ts) {
-                                            best_click = &(*it);
-                                        } else if (it->ts == best_click->ts) {
-                                            if (it->click_id < best_click->click_id) {
-                                                best_click = &(*it);
+                                        if (it->ts > best_clk->ts) {
+                                            best_clk = it;
+                                        } else if (it->ts == best_clk->ts) {
+                                            if (it->cid < best_clk->cid) {
+                                                best_clk = it;
                                             }
                                         }
                                     }
                                 }
+                                if (best_clk) cred_camp_idx = best_clk->camp_idx;
+                            }
 
-                                if (best_click) {
-                                    credited_camp = best_click->campaign_id;
+                            size_t cred_pos = static_cast<size_t>(cred_camp_idx) * num_window_days + day_offset;
+                            auto& cd = my_camp_stats[cred_pos];
+                            cd.sessions++;
+                            if (s_has_purchase) cd.purchasing++;
+                            cd.revenue += s_revenue;
+
+                            if (!asst_list.empty()) {
+                                std::sort(asst_list.begin(), asst_list.end());
+                                for (size_t a = 0; a < asst_list.size(); ++a) {
+                                    if (a == 0 || asst_list[a] != asst_list[a - 1]) {
+                                        size_t asst_pos = static_cast<size_t>(asst_list[a]) * num_window_days + day_offset;
+                                        my_camp_stats[asst_pos].assisted++;
+                                    }
                                 }
                             }
+                        };
 
-                            AggKey cd_cred_key{credited_camp, s_day};
-                            auto& cd_cred = campaign_daily_agg[cd_cred_key];
-                            cd_cred.sessions++;
-                            if (s_has_purchase) cd_cred.purchasing_sessions++;
-                            cd_cred.revenue_cents += s_revenue;
-
-                            for (const auto& ac : assisting_camps) {
-                                AggKey cd_asst_key{ac, s_day};
-                                campaign_daily_agg[cd_asst_key].assisted_sessions++;
+                        for (size_t i = ev_idx; i < ev_end; ++i) {
+                            int64_t ev_ts = ps_events[i].ts;
+                            if (ev_ts != prev_distinct_ts) {
+                                if (ev_ts - prev_distinct_ts > THIRTY_MINS) {
+                                    process_session(sess_start_idx, i, sess_start_ts);
+                                    sess_start_idx = i;
+                                    sess_start_ts = ev_ts;
+                                }
+                                prev_distinct_ts = ev_ts;
                             }
                         }
+                        process_session(sess_start_idx, ev_end, sess_start_ts);
+
+                        // Emit user_daily rows for this person
+                        for (int d_off : visited_days) {
+                            auto& stats = user_days[d_off];
+                            std::string_view top_cat = "";
+                            int64_t max_rev = -1;
+                            for (size_t c = 0; c < cat_names.size() && c < 32; ++c) {
+                                int64_t r = stats.cat_rev[c];
+                                if (r > 0) {
+                                    if (r > max_rev) {
+                                        max_rev = r;
+                                        top_cat = cat_names[c];
+                                    } else if (r == max_rev) {
+                                        if (cat_names[c] < top_cat) {
+                                            top_cat = cat_names[c];
+                                        }
+                                    }
+                                }
+                            }
+                            shard_user_daily_rows[ps].push_back(UserDailyRow{
+                                cur_pid, win_start_day + d_off, stats.sessions, stats.events, stats.revenue, top_cat
+                            });
+                            // Reset for next person
+                            stats = UdStats{};
+                        }
+
+                        ev_idx = ev_end;
                     }
                 }
             });
@@ -837,63 +1189,184 @@ int main(int argc, char* argv[]) {
         for (auto& w : workers) w.join();
     }
 
-    // Merge campaign_daily across person shards
-    std::unordered_map<AggKey, CampaignDailyStats, AggKeyHash> merged_campaign_daily;
+    // Merge campaign_daily rows across shards
+    std::vector<ShardCdStats> merged_camp_day(camp_list.size() * num_window_days);
     for (size_t s = 0; s < NUM_SHARDS; ++s) {
-        for (auto& [k, v] : final_campaign_daily[s]) {
-            auto& m = merged_campaign_daily[k];
-            m.sessions += v.sessions;
-            m.purchasing_sessions += v.purchasing_sessions;
-            m.revenue_cents += v.revenue_cents;
-            m.assisted_sessions += v.assisted_sessions;
+        for (size_t idx = 0; idx < merged_camp_day.size(); ++idx) {
+            const auto& src = shard_camp_stats[s][idx];
+            merged_camp_day[idx].sessions += src.sessions;
+            merged_camp_day[idx].purchasing += src.purchasing;
+            merged_camp_day[idx].revenue += src.revenue;
+            merged_camp_day[idx].assisted += src.assisted;
         }
     }
 
-    // Write clean TSV files into scratch_dir
+    // Write binary buffers and TSV files
     fs::create_directories(scratch_dir);
+
+    // 1. Write _ud.bin
+    {
+        size_t total_ud = 0;
+        size_t u_chars_len = 0;
+        size_t cat_chars_len = 0;
+        for (size_t s = 0; s < NUM_SHARDS; ++s) {
+            total_ud += shard_user_daily_rows[s].size();
+            for (const auto& r : shard_user_daily_rows[s]) {
+                u_chars_len += r.user_id.size();
+                if (!r.top_category.empty()) {
+                    cat_chars_len += r.top_category.size();
+                }
+            }
+        }
+
+        std::vector<int32_t> b_days; b_days.reserve(total_ud);
+        std::vector<int64_t> b_sess; b_sess.reserve(total_ud);
+        std::vector<int64_t> b_evts; b_evts.reserve(total_ud);
+        std::vector<int64_t> b_rev; b_rev.reserve(total_ud);
+        std::vector<int32_t> b_u_off; b_u_off.reserve(total_ud + 1);
+        std::string b_u_chars; b_u_chars.reserve(u_chars_len);
+
+        size_t c_bmp_len = (total_ud + 7) / 8;
+        std::vector<uint8_t> b_c_bmp(c_bmp_len, 0);
+        std::vector<int32_t> b_c_off; b_c_off.reserve(total_ud + 1);
+        std::string b_c_chars; b_c_chars.reserve(cat_chars_len);
+
+        b_u_off.push_back(0);
+        b_c_off.push_back(0);
+
+        size_t row_idx = 0;
+        for (size_t s = 0; s < NUM_SHARDS; ++s) {
+            for (const auto& r : shard_user_daily_rows[s]) {
+                b_days.push_back(r.day);
+                b_sess.push_back(r.sessions);
+                b_evts.push_back(r.events);
+                b_rev.push_back(r.revenue_cents);
+
+                b_u_chars.append(r.user_id);
+                b_u_off.push_back(static_cast<int32_t>(b_u_chars.size()));
+
+                if (!r.top_category.empty()) {
+                    b_c_bmp[row_idx / 8] |= (1 << (row_idx % 8));
+                    b_c_chars.append(r.top_category);
+                }
+                b_c_off.push_back(static_cast<int32_t>(b_c_chars.size()));
+                row_idx++;
+            }
+        }
+
+        uint64_t header[4] = {
+            static_cast<uint64_t>(total_ud),
+            static_cast<uint64_t>(b_u_chars.size()),
+            static_cast<uint64_t>(b_c_chars.size()),
+            0
+        };
+
+        std::ofstream out(scratch_dir + "/_ud.bin", std::ios::binary);
+        out.write(reinterpret_cast<const char*>(header), sizeof(header));
+        out.write(reinterpret_cast<const char*>(b_days.data()), b_days.size() * sizeof(int32_t));
+        out.write(reinterpret_cast<const char*>(b_sess.data()), b_sess.size() * sizeof(int64_t));
+        out.write(reinterpret_cast<const char*>(b_evts.data()), b_evts.size() * sizeof(int64_t));
+        out.write(reinterpret_cast<const char*>(b_rev.data()), b_rev.size() * sizeof(int64_t));
+        out.write(reinterpret_cast<const char*>(b_u_off.data()), b_u_off.size() * sizeof(int32_t));
+        out.write(b_u_chars.data(), b_u_chars.size());
+        out.write(reinterpret_cast<const char*>(b_c_bmp.data()), b_c_bmp.size());
+        out.write(reinterpret_cast<const char*>(b_c_off.data()), b_c_off.size() * sizeof(int32_t));
+        out.write(b_c_chars.data(), b_c_chars.size());
+    }
+
+    // 2. Write _cd.bin
+    {
+        size_t total_cd = 0;
+        size_t cid_chars_len = 0;
+        size_t chn_chars_len = 0;
+        for (size_t c = 0; c < camp_list.size(); ++c) {
+            for (int d = 0; d < num_window_days; ++d) {
+                const auto& cd = merged_camp_day[c * num_window_days + d];
+                if (cd.sessions > 0 || cd.assisted > 0) {
+                    total_cd++;
+                    cid_chars_len += camp_list[c].first.size();
+                    chn_chars_len += camp_list[c].second.size();
+                }
+            }
+        }
+
+        std::vector<int32_t> b_days; b_days.reserve(total_cd);
+        std::vector<int64_t> b_sess; b_sess.reserve(total_cd);
+        std::vector<int64_t> b_psess; b_psess.reserve(total_cd);
+        std::vector<int64_t> b_rev; b_rev.reserve(total_cd);
+        std::vector<int64_t> b_asst; b_asst.reserve(total_cd);
+
+        std::vector<int32_t> b_cid_off; b_cid_off.reserve(total_cd + 1);
+        std::string b_cid_chars; b_cid_chars.reserve(cid_chars_len);
+
+        std::vector<int32_t> b_chn_off; b_chn_off.reserve(total_cd + 1);
+        std::string b_chn_chars; b_chn_chars.reserve(chn_chars_len);
+
+        b_cid_off.push_back(0);
+        b_chn_off.push_back(0);
+
+        for (size_t c = 0; c < camp_list.size(); ++c) {
+            for (int d = 0; d < num_window_days; ++d) {
+                const auto& cd = merged_camp_day[c * num_window_days + d];
+                if (cd.sessions > 0 || cd.assisted > 0) {
+                    b_days.push_back(win_start_day + d);
+                    b_sess.push_back(cd.sessions);
+                    b_psess.push_back(cd.purchasing);
+                    b_rev.push_back(cd.revenue);
+                    b_asst.push_back(cd.assisted);
+
+                    b_cid_chars.append(camp_list[c].first);
+                    b_cid_off.push_back(static_cast<int32_t>(b_cid_chars.size()));
+
+                    b_chn_chars.append(camp_list[c].second);
+                    b_chn_off.push_back(static_cast<int32_t>(b_chn_chars.size()));
+                }
+            }
+        }
+
+        uint64_t header[4] = {
+            static_cast<uint64_t>(total_cd),
+            static_cast<uint64_t>(b_cid_chars.size()),
+            static_cast<uint64_t>(b_chn_chars.size()),
+            0
+        };
+
+        std::ofstream out(scratch_dir + "/_cd.bin", std::ios::binary);
+        out.write(reinterpret_cast<const char*>(header), sizeof(header));
+        out.write(reinterpret_cast<const char*>(b_days.data()), b_days.size() * sizeof(int32_t));
+        out.write(reinterpret_cast<const char*>(b_sess.data()), b_sess.size() * sizeof(int64_t));
+        out.write(reinterpret_cast<const char*>(b_psess.data()), b_psess.size() * sizeof(int64_t));
+        out.write(reinterpret_cast<const char*>(b_rev.data()), b_rev.size() * sizeof(int64_t));
+        out.write(reinterpret_cast<const char*>(b_asst.data()), b_asst.size() * sizeof(int64_t));
+        out.write(reinterpret_cast<const char*>(b_cid_off.data()), b_cid_off.size() * sizeof(int32_t));
+        out.write(b_cid_chars.data(), b_cid_chars.size());
+        out.write(reinterpret_cast<const char*>(b_chn_off.data()), b_chn_off.size() * sizeof(int32_t));
+        out.write(b_chn_chars.data(), b_chn_chars.size());
+    }
+
+    // Write TSV files as well
     {
         std::ofstream out_ud(scratch_dir + "/_ud.tsv");
         for (size_t s = 0; s < NUM_SHARDS; ++s) {
-            for (auto& [key, stats] : final_user_daily[s]) {
-                std::string p_id = key.id;
-                int32_t s_day = key.day;
-
-                std::string top_cat = "";
-                if (!stats.cat_rev.empty()) {
-                    int64_t best_rev = -1;
-                    for (auto& [cat, rev] : stats.cat_rev) {
-                        if (rev > best_rev) {
-                            best_rev = rev;
-                            top_cat = cat;
-                        } else if (rev == best_rev) {
-                            if (cat < top_cat) {
-                                top_cat = cat;
-                            }
-                        }
-                    }
-                }
-
-                out_ud << p_id << '\t' << s_day << '\t' << stats.sessions << '\t'
-                       << stats.events << '\t' << stats.revenue_cents << '\t' << top_cat << '\n';
+            for (const auto& r : shard_user_daily_rows[s]) {
+                out_ud << r.user_id << '\t' << r.day << '\t' << r.sessions << '\t'
+                       << r.events << '\t' << r.revenue_cents << '\t' << r.top_category << '\n';
             }
         }
     }
 
     {
         std::ofstream out_cd(scratch_dir + "/_cd.tsv");
-        for (auto& [key, stats] : merged_campaign_daily) {
-            std::string c_id = key.id;
-            int32_t s_day = key.day;
-
-            std::string channel = "organic";
-            if (c_id != "organic") {
-                auto it = campaigns.find(c_id);
-                if (it != campaigns.end()) channel = it->second;
+        for (size_t c = 0; c < camp_list.size(); ++c) {
+            for (int d = 0; d < num_window_days; ++d) {
+                const auto& cd = merged_camp_day[c * num_window_days + d];
+                if (cd.sessions > 0 || cd.assisted > 0) {
+                    out_cd << camp_list[c].first << '\t' << camp_list[c].second << '\t'
+                           << (win_start_day + d) << '\t'
+                           << cd.sessions << '\t' << cd.purchasing << '\t'
+                           << cd.revenue << '\t' << cd.assisted << '\n';
+                }
             }
-
-            out_cd << c_id << '\t' << channel << '\t' << s_day << '\t'
-                   << stats.sessions << '\t' << stats.purchasing_sessions << '\t'
-                   << stats.revenue_cents << '\t' << stats.assisted_sessions << '\n';
         }
     }
 

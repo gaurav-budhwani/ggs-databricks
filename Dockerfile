@@ -16,7 +16,7 @@ COPY src/ /app/src/
 COPY run.sh /app/run.sh
 
 # Compile C++ engine with native optimization
-RUN g++ -O3 -std=c++20 -march=x86-64-v3 -pthread \
+RUN g++ -O3 -std=c++20 -march=x86-64-v3 -DNDEBUG -pthread \
     /app/src/engine.cpp \
     -o /app/engine \
     && apt-get purge -y build-essential \
